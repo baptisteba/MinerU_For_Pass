@@ -66,10 +66,10 @@ from .common import do_parse, read_fn, pdf_suffixes, image_suffixes
                        'latin', 'arabic', 'east_slavic', 'cyrillic', 'devanagari']),
     help="""
     Input the languages in the pdf (if known) to improve OCR accuracy.  Optional.
-    Without languages specified, 'ch' will be used by default.
+    Without languages specified, 'en' will be used by default.
     Adapted only for the case where the backend is set to "pipeline".
     """,
-    default='ch',
+    default='en',
 )
 @click.option(
     '-u',
@@ -137,13 +137,20 @@ from .common import do_parse, read_fn, pdf_suffixes, image_suffixes
     """,
     default='huggingface',
 )
+@click.option(
+    '--images',
+    'images_enable',
+    type=bool,
+    help='Enable image paths in markdown output. Default is False (images disabled).',
+    default=False,
+)
 
 
 def main(
         ctx,
         input_path, output_dir, method, backend, lang, server_url,
         start_page_id, end_page_id, formula_enable, table_enable,
-        device_mode, virtual_vram, model_source, **kwargs
+        device_mode, virtual_vram, model_source, images_enable, **kwargs
 ):
 
     kwargs.update(arg_parse(ctx))
@@ -194,6 +201,7 @@ def main(
                 server_url=server_url,
                 start_page_id=start_page_id,
                 end_page_id=end_page_id,
+                images_enable=images_enable,
                 **kwargs,
             )
         except Exception as e:

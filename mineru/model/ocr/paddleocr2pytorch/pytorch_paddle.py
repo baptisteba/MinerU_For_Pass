@@ -55,7 +55,7 @@ class PytorchPaddleOCR(TextSystem):
         parser = utility.init_args()
         args = parser.parse_args(args)
 
-        self.lang = kwargs.get('lang', 'ch')
+        self.lang = kwargs.get('lang', 'en')
         self.enable_merge_det_boxes = kwargs.get("enable_merge_det_boxes", True)
 
         device = get_device()

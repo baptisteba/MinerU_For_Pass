@@ -18,7 +18,7 @@ display_right_delimiter = delimiters['display']['right']
 inline_left_delimiter = delimiters['inline']['left']
 inline_right_delimiter = delimiters['inline']['right']
 
-def merge_para_with_text(para_block, formula_enable=True, img_buket_path=''):
+def merge_para_with_text(para_block, formula_enable=True, img_buket_path='', images_enable=True):
     para_text = ''
     for line in para_block['lines']:
         for j, span in enumerate(line['spans']):
@@ -32,7 +32,7 @@ def merge_para_with_text(para_block, formula_enable=True, img_buket_path=''):
                 if formula_enable:
                     content = f"\n{display_left_delimiter}\n{span['content']}\n{display_right_delimiter}\n"
                 else:
-                    if span.get('image_path', ''):
+                    if span.get('image_path', '') and images_enable:
                         content = f"![]({img_buket_path}/{span['image_path']})"
             # content = content.strip()
             if content:
@@ -45,16 +45,16 @@ def merge_para_with_text(para_block, formula_enable=True, img_buket_path=''):
                     para_text += content
     return para_text
 
-def mk_blocks_to_markdown(para_blocks, make_mode, formula_enable, table_enable, img_buket_path=''):
+def mk_blocks_to_markdown(para_blocks, make_mode, formula_enable, table_enable, img_buket_path='', images_enable=True):
     page_markdown = []
     for para_block in para_blocks:
         para_text = ''
         para_type = para_block['type']
         if para_type in [BlockType.TEXT, BlockType.LIST, BlockType.INDEX, BlockType.INTERLINE_EQUATION]:
-            para_text = merge_para_with_text(para_block, formula_enable=formula_enable, img_buket_path=img_buket_path)
+            para_text = merge_para_with_text(para_block, formula_enable=formula_enable, img_buket_path=img_buket_path, images_enable=images_enable)
         elif para_type == BlockType.TITLE:
             title_level = get_title_level(para_block)
-            para_text = f'{"#" * title_level} {merge_para_with_text(para_block)}'
+            para_text = f'{"#" * title_level} {merge_para_with_text(para_block, images_enable=images_enable)}'
         elif para_type == BlockType.IMAGE:
             if make_mode == MakeMode.NLP_MD:
                 continue
@@ -65,28 +65,28 @@ def mk_blocks_to_markdown(para_blocks, make_mode, formula_enable, table_enable, 
                 if has_image_footnote:
                     for block in para_block['blocks']:  # 1st.拼image_caption
                         if block['type'] == BlockType.IMAGE_CAPTION:
-                            para_text += merge_para_with_text(block) + '  \n'
+                            para_text += merge_para_with_text(block, images_enable=images_enable) + '  \n'
                     for block in para_block['blocks']:  # 2nd.拼image_body
                         if block['type'] == BlockType.IMAGE_BODY:
                             for line in block['lines']:
                                 for span in line['spans']:
                                     if span['type'] == ContentType.IMAGE:
-                                        if span.get('image_path', ''):
+                                        if span.get('image_path', '') and images_enable:
                                             para_text += f"![]({img_buket_path}/{span['image_path']})"
                     for block in para_block['blocks']:  # 3rd.拼image_footnote
                         if block['type'] == BlockType.IMAGE_FOOTNOTE:
-                            para_text += '  \n' + merge_para_with_text(block)
+                            para_text += '  \n' + merge_para_with_text(block, images_enable=images_enable)
                 else:
                     for block in para_block['blocks']:  # 1st.拼image_body
                         if block['type'] == BlockType.IMAGE_BODY:
                             for line in block['lines']:
                                 for span in line['spans']:
                                     if span['type'] == ContentType.IMAGE:
-                                        if span.get('image_path', ''):
+                                        if span.get('image_path', '') and images_enable:
                                             para_text += f"![]({img_buket_path}/{span['image_path']})"
                     for block in para_block['blocks']:  # 2nd.拼image_caption
                         if block['type'] == BlockType.IMAGE_CAPTION:
-                            para_text += '  \n' + merge_para_with_text(block)
+                            para_text += '  \n' + merge_para_with_text(block, images_enable=images_enable)
 
         elif para_type == BlockType.TABLE:
             if make_mode == MakeMode.NLP_MD:
@@ -197,6 +197,7 @@ def make_blocks_to_content_list(para_block, img_buket_path, page_idx, page_size)
 def union_make(pdf_info_dict: list,
                make_mode: str,
                img_buket_path: str = '',
+               images_enable: bool = True,
                ):
 
     formula_enable = get_formula_enable(os.getenv('MINERU_VLM_FORMULA_ENABLE', 'True').lower() == 'true')
@@ -210,7 +211,7 @@ def union_make(pdf_info_dict: list,
         if not paras_of_layout:
             continue
         if make_mode in [MakeMode.MM_MD, MakeMode.NLP_MD]:
-            page_markdown = mk_blocks_to_markdown(paras_of_layout, make_mode, formula_enable, table_enable, img_buket_path)
+            page_markdown = mk_blocks_to_markdown(paras_of_layout, make_mode, formula_enable, table_enable, img_buket_path, images_enable)
             output_content.extend(page_markdown)
         elif make_mode == MakeMode.CONTENT_LIST:
             for para_block in paras_of_layout:

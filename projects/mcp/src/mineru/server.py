@@ -181,8 +181,9 @@ def parse_list_input(input_str: str) -> List[str]:
 async def convert_file_url(
     url: str,
     enable_ocr: bool = False,
-    language: str = "ch",
+    language: str = "en",
     page_ranges: str | None = None,
+    images_enable: bool = False,
 ) -> Dict[str, Any]:
     """
     从URL转换文件到Markdown格式。支持单个或多个URL处理。
@@ -256,8 +257,9 @@ async def convert_file_url(
 async def convert_file_path(
     file_path: str,
     enable_ocr: bool = False,
-    language: str = "ch",
+    language: str = "en",
     page_ranges: str | None = None,
+    images_enable: bool = False,
 ) -> Dict[str, Any]:
     """
     将本地文件转换为Markdown格式。支持单个或多个文件批量处理。

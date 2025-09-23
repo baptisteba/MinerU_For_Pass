@@ -22,7 +22,7 @@ def do_parse(
     output_dir,  # Output directory for storing parsing results
     pdf_file_names: list[str],  # List of PDF file names to be parsed
     pdf_bytes_list: list[bytes],  # List of PDF bytes to be parsed
-    p_lang_list: list[str],  # List of languages for each PDF, default is 'ch' (Chinese)
+    p_lang_list: list[str],  # List of languages for each PDF, default is 'en' (English)
     backend="pipeline",  # The backend for parsing PDF, default is 'pipeline'
     parse_method="auto",  # The method for parsing PDF, default is 'auto'
     formula_enable=True,  # Enable formula parsing
@@ -165,18 +165,19 @@ def do_parse(
 def parse_doc(
         path_list: list[Path],
         output_dir,
-        lang="ch",
+        lang="en",
         backend="pipeline",
         method="auto",
         server_url=None,
         start_page_id=0,
-        end_page_id=None
+        end_page_id=None,
+        images_enable=False
 ):
     """
         Parameter description:
         path_list: List of document paths to be parsed, can be PDF or image files.
         output_dir: Output directory for storing parsing results.
-        lang: Language option, default is 'ch', optional values include['ch', 'ch_server', 'ch_lite', 'en', 'korean', 'japan', 'chinese_cht', 'ta', 'te', 'ka']。
+        lang: Language option, default is 'en', optional values include['ch', 'ch_server', 'ch_lite', 'en', 'korean', 'japan', 'chinese_cht', 'ta', 'te', 'ka']。
             Input the languages in the pdf (if known) to improve OCR accuracy.  Optional.
             Adapted only for the case where the backend is set to "pipeline"
         backend: the backend for parsing pdf:
@@ -214,7 +215,8 @@ def parse_doc(
             parse_method=method,
             server_url=server_url,
             start_page_id=start_page_id,
-            end_page_id=end_page_id
+            end_page_id=end_page_id,
+            images_enable=images_enable
         )
     except Exception as e:
         logger.exception(e)

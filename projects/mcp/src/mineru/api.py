@@ -94,7 +94,7 @@ class MinerUClient:
         self,
         urls: Union[str, List[Union[str, Dict[str, Any]]], Dict[str, Any]],
         enable_ocr: bool = True,
-        language: str = "ch",
+        language: str = "en",
         page_ranges: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -222,7 +222,7 @@ class MinerUClient:
         self,
         files: Union[str, List[Union[str, Dict[str, Any]]], Dict[str, Any]],
         enable_ocr: bool = True,
-        language: str = "ch",
+        language: str = "en",
         page_ranges: Optional[str] = None,
     ) -> Dict[str, Any]:
         """

@@ -6,18 +6,132 @@ import re
 import time
 import zipfile
 from pathlib import Path
+import asyncio
+import threading
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Tuple, Optional, Dict
 
 import click
 import gradio as gr
 from gradio_pdf import PDF
 from loguru import logger
 
+# Optional import for HTML table parsing
+try:
+    from bs4 import BeautifulSoup
+    HAS_BEAUTIFULSOUP = True
+except ImportError:
+    HAS_BEAUTIFULSOUP = False
+    logger.warning("BeautifulSoup not available. HTML to CSV conversion will use basic regex parsing.")
+
 from mineru.cli.common import prepare_env, read_fn, aio_do_parse, pdf_suffixes, image_suffixes
 from mineru.utils.cli_parser import arg_parse
 from mineru.utils.hash_utils import str_sha256
 
+# Optional psutil import for system capacity detection
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    logger.warning("psutil not available - using conservative batch processing settings")
 
-async def parse_pdf(doc_path, output_dir, end_page_id, is_ocr, formula_enable, table_enable, language, backend, url):
+
+class BatchProcessingTracker:
+    """Tracks progress and errors for batch processing operations."""
+
+    def __init__(self, total_files: int):
+        self.total_files = total_files
+        self.processed_files = 0
+        self.successful_files = 0
+        self.failed_files = 0
+        self.error_details: List[Dict] = []
+        self.current_file = ""
+
+    def update_current_file(self, file_path: str):
+        """Update the currently processing file."""
+        self.current_file = file_path
+
+    def mark_success(self, file_path: str):
+        """Mark a file as successfully processed."""
+        self.processed_files += 1
+        self.successful_files += 1
+
+    def mark_failure(self, file_path: str, error_message: str):
+        """Mark a file as failed and record error details."""
+        self.processed_files += 1
+        self.failed_files += 1
+        self.error_details.append({
+            'file_path': file_path,
+            'error': error_message,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    def get_status_message(self) -> str:
+        """Get current status message."""
+        remaining = self.total_files - self.processed_files
+        progress_pct = (self.processed_files / self.total_files * 100) if self.total_files > 0 else 0
+
+        status = f"📊 Progress: {self.processed_files}/{self.total_files} ({progress_pct:.1f}%)\n"
+        status += f"✅ Successful: {self.successful_files}\n"
+        status += f"❌ Failed: {self.failed_files}\n"
+        status += f"⏳ Remaining: {remaining}\n"
+
+        if self.current_file:
+            status += f"🔄 Current: {os.path.basename(self.current_file)}"
+
+        return status
+
+    def get_error_summary(self) -> str:
+        """Get a summary of all errors encountered."""
+        if not self.error_details:
+            return "✅ No errors encountered during processing."
+
+        summary = f"❌ Error Summary ({len(self.error_details)} files failed):\n\n"
+        for i, error in enumerate(self.error_details, 1):
+            filename = os.path.basename(error['file_path'])
+            summary += f"{i}. {filename}\n"
+            summary += f"   Error: {error['error']}\n"
+            summary += f"   Time: {error['timestamp']}\n\n"
+
+        return summary
+
+
+def move_file_to_error_folder(file_path: str, output_dir: str, relative_path: str) -> str:
+    """
+    Move a file that failed processing to the ERRORED folder while maintaining directory structure.
+
+    Args:
+        file_path: Absolute path to the original file
+        output_dir: Base output directory
+        relative_path: Relative path from input directory
+
+    Returns:
+        Path to the moved file in ERRORED folder
+    """
+    try:
+        # Create ERRORED directory structure
+        error_base_dir = os.path.join(output_dir, "ERRORED")
+        relative_dir = os.path.dirname(relative_path)
+        error_subdir = os.path.join(error_base_dir, relative_dir) if relative_dir else error_base_dir
+
+        os.makedirs(error_subdir, exist_ok=True)
+
+        # Create destination path
+        filename = os.path.basename(file_path)
+        error_file_path = os.path.join(error_subdir, filename)
+
+        # Copy file to error folder (don't move original in case user wants to retry)
+        shutil.copy2(file_path, error_file_path)
+
+        return error_file_path
+    except Exception as e:
+        logger.warning(f"Failed to move file to ERRORED folder: {e}")
+        return None
+
+
+async def parse_pdf(doc_path, output_dir, end_page_id, is_ocr, formula_enable, table_enable, language, backend, url, images_enable=False, md_only=False, fast_mode=False):
     os.makedirs(output_dir, exist_ok=True)
 
     try:
@@ -31,18 +145,49 @@ async def parse_pdf(doc_path, output_dir, end_page_id, is_ocr, formula_enable, t
         if backend.startswith("vlm"):
             parse_method = "vlm"
 
-        local_image_dir, local_md_dir = prepare_env(output_dir, file_name, parse_method)
+        # Apply MD-only and fast mode optimizations
+        if md_only:
+            # In MD-only mode, disable images to prevent images folder creation
+            images_enable = False
+
+        if fast_mode and md_only:
+            # In fast mode with MD-only, disable formula recognition but keep table recognition
+            formula_enable = False
+            # table_enable remains unchanged - keep tables for better content extraction
+            # Also consider reducing OCR precision for speed (can add more optimizations here)
+            # For now, we rely on the backend optimizations
+
+        if md_only:
+            # For MD-only mode, override parse_method to be empty so prepare_env doesn't create subdirectory
+            actual_parse_method = ""
+            local_md_dir = os.path.join(output_dir, file_name)
+            # Don't create images directory in MD-only mode
+            local_image_dir = None
+        else:
+            # Use standard environment preparation for full output
+            local_image_dir, local_md_dir = prepare_env(output_dir, file_name, parse_method)
+            actual_parse_method = parse_method
+
         await aio_do_parse(
             output_dir=output_dir,
             pdf_file_names=[file_name],
             pdf_bytes_list=[pdf_data],
             p_lang_list=[language],
-            parse_method=parse_method,
+            parse_method=actual_parse_method,
             end_page_id=end_page_id,
             formula_enable=formula_enable,
             table_enable=table_enable,
             backend=backend,
             server_url=url,
+            images_enable=images_enable,
+            # MD-only flags
+            f_draw_layout_bbox=not md_only,
+            f_draw_span_bbox=not md_only,
+            f_dump_md=True,  # Always generate MD
+            f_dump_middle_json=not md_only,
+            f_dump_model_output=not md_only,
+            f_dump_orig_pdf=not md_only,
+            f_dump_content_list=not md_only,
         )
         return local_md_dir, file_name
     except Exception as e:
@@ -79,6 +224,151 @@ def image_to_base64(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 
+def html_table_to_csv(html_table):
+    """
+    Convert HTML table to CSV format for markdown display.
+
+    Args:
+        html_table (str): HTML table string
+
+    Returns:
+        str: CSV formatted table for markdown
+    """
+    try:
+        if HAS_BEAUTIFULSOUP:
+            # Use BeautifulSoup for robust HTML parsing
+            soup = BeautifulSoup(html_table, 'html.parser')
+            table = soup.find('table')
+
+            if not table:
+                return html_table  # Return original if no table found
+
+            rows = []
+
+            # Extract all rows (including header and body)
+            for tr in table.find_all('tr'):
+                cells = []
+                for cell in tr.find_all(['td', 'th']):
+                    # Get cell text and clean it
+                    cell_text = cell.get_text(strip=True)
+                    # Escape any commas or quotes in cell content
+                    if ',' in cell_text or '"' in cell_text or '\n' in cell_text:
+                        cell_text = '"' + cell_text.replace('"', '""') + '"'
+                    cells.append(cell_text)
+
+                if cells:  # Only add non-empty rows
+                    rows.append(','.join(cells))
+
+            if not rows:
+                return html_table  # Return original if no rows found
+
+            # Format as markdown CSV table
+            csv_content = '\n'.join(rows)
+
+            # Wrap in markdown code block with csv language for proper formatting
+            return f"```csv\n{csv_content}\n```"
+
+        else:
+            # Fallback: Basic regex-based parsing when BeautifulSoup is not available
+            return _html_table_to_csv_regex(html_table)
+
+    except Exception as e:
+        logger.warning(f"Failed to convert HTML table to CSV: {e}")
+        return html_table  # Return original HTML on error
+
+
+def _html_table_to_csv_regex(html_table):
+    """
+    Fallback function to convert HTML table to CSV using regex when BeautifulSoup is not available.
+
+    Args:
+        html_table (str): HTML table string
+
+    Returns:
+        str: CSV formatted table for markdown
+    """
+    try:
+        import re
+
+        # Extract table content
+        table_match = re.search(r'<table[^>]*>(.*?)</table>', html_table, re.DOTALL | re.IGNORECASE)
+        if not table_match:
+            return html_table
+
+        table_content = table_match.group(1)
+
+        # Extract rows
+        row_pattern = r'<tr[^>]*>(.*?)</tr>'
+        row_matches = re.findall(row_pattern, table_content, re.DOTALL | re.IGNORECASE)
+
+        csv_rows = []
+        for row_html in row_matches:
+            # Extract cells (both td and th)
+            cell_pattern = r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>'
+            cell_matches = re.findall(cell_pattern, row_html, re.DOTALL | re.IGNORECASE)
+
+            if cell_matches:
+                cells = []
+                for cell_html in cell_matches:
+                    # Clean up HTML tags and entities
+                    cell_text = re.sub(r'<[^>]+>', '', cell_html)  # Remove HTML tags
+                    cell_text = cell_text.strip()
+
+                    # Handle basic HTML entities
+                    cell_text = cell_text.replace('&nbsp;', ' ')
+                    cell_text = cell_text.replace('&amp;', '&')
+                    cell_text = cell_text.replace('&lt;', '<')
+                    cell_text = cell_text.replace('&gt;', '>')
+                    cell_text = cell_text.replace('&quot;', '"')
+
+                    # Escape CSV special characters
+                    if ',' in cell_text or '"' in cell_text or '\n' in cell_text:
+                        cell_text = '"' + cell_text.replace('"', '""') + '"'
+
+                    cells.append(cell_text)
+
+                if cells:
+                    csv_rows.append(','.join(cells))
+
+        if not csv_rows:
+            return html_table
+
+        # Format as markdown CSV table
+        csv_content = '\n'.join(csv_rows)
+        return f"```csv\n{csv_content}\n```"
+
+    except Exception as e:
+        logger.warning(f"Failed to convert HTML table to CSV using regex fallback: {e}")
+        return html_table
+
+
+def convert_tables_to_csv_in_markdown(markdown_text, csv_tables_enabled=True):
+    """
+    Convert all HTML tables in markdown text to CSV format.
+
+    Args:
+        markdown_text (str): Markdown text containing HTML tables
+        csv_tables_enabled (bool): Whether to convert tables to CSV
+
+    Returns:
+        str: Markdown text with CSV tables (if enabled) or original text
+    """
+    if not csv_tables_enabled:
+        return markdown_text
+
+    # Pattern to match HTML tables in markdown
+    table_pattern = r'<table[^>]*>.*?</table>'
+
+    def replace_table(match):
+        html_table = match.group(0)
+        return html_table_to_csv(html_table)
+
+    # Replace all HTML tables with CSV format
+    converted_text = re.sub(table_pattern, replace_table, markdown_text, flags=re.DOTALL | re.IGNORECASE)
+
+    return converted_text
+
+
 def replace_image_with_base64(markdown_text, image_dir_path):
     # 匹配Markdown中的图片标签
     pattern = r'\!\[(?:[^\]]*)\]\(([^)]+)\)'
@@ -94,22 +384,38 @@ def replace_image_with_base64(markdown_text, image_dir_path):
     return re.sub(pattern, replace, markdown_text)
 
 
-async def to_markdown(file_path, end_pages=10, is_ocr=False, formula_enable=True, table_enable=True, language="ch", backend="pipeline", url=None):
+async def to_markdown(file_path, end_pages=10, is_ocr=False, formula_enable=True, table_enable=True, language="ch", backend="pipeline", url=None, images_enable=False, md_only=False, fast_mode=False, csv_tables=True):
     file_path = to_pdf(file_path)
     # 获取识别的md文件以及压缩包文件路径
-    local_md_dir, file_name = await parse_pdf(file_path, './output', end_pages - 1, is_ocr, formula_enable, table_enable, language, backend, url)
-    archive_zip_path = os.path.join('./output', str_sha256(local_md_dir) + '.zip')
-    zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
-    if zip_archive_success == 0:
-        logger.info('Compression successful')
-    else:
-        logger.error('Compression failed')
+    local_md_dir, file_name = await parse_pdf(file_path, './output', end_pages - 1, is_ocr, formula_enable, table_enable, language, backend, url, images_enable, md_only, fast_mode)
+
+    # Only create archive if not MD-only mode
+    archive_zip_path = None
+    if not md_only:
+        archive_zip_path = os.path.join('./output', str_sha256(local_md_dir) + '.zip')
+        zip_archive_success = compress_directory_to_zip(local_md_dir, archive_zip_path)
+        if zip_archive_success == 0:
+            logger.info('Compression successful')
+        else:
+            logger.error('Compression failed')
+            archive_zip_path = None
+
     md_path = os.path.join(local_md_dir, file_name + '.md')
     with open(md_path, 'r', encoding='utf-8') as f:
         txt_content = f.read()
+
+    # Apply CSV table conversion if enabled
+    if csv_tables:
+        txt_content = convert_tables_to_csv_in_markdown(txt_content, csv_tables_enabled=True)
+
     md_content = replace_image_with_base64(txt_content, local_md_dir)
-    # 返回转换后的PDF路径
-    new_pdf_path = os.path.join(local_md_dir, file_name + '_layout.pdf')
+
+    # Only return PDF path if not MD-only mode
+    new_pdf_path = None
+    if not md_only:
+        layout_pdf_path = os.path.join(local_md_dir, file_name + '_layout.pdf')
+        if os.path.exists(layout_pdf_path):
+            new_pdf_path = layout_pdf_path
 
     return md_content, txt_content, archive_zip_path, new_pdf_path
 
@@ -178,6 +484,483 @@ def to_pdf(file_path):
         tmp_pdf_file.write(pdf_bytes)
 
     return tmp_file_path
+
+
+def scan_directory_for_pdfs(directory_path: str) -> List[Tuple[str, str]]:
+    """
+    Recursively scan directory for PDF files.
+
+    Args:
+        directory_path: Path to the directory to scan
+
+    Returns:
+        List of tuples (absolute_path, relative_path_from_root) sorted by path
+    """
+    if not os.path.exists(directory_path):
+        raise ValueError(f"Directory does not exist: {directory_path}")
+
+    pdf_files = []
+    root_path = Path(directory_path).resolve()
+
+    for root, dirs, files in os.walk(directory_path):
+        # Sort directories and files to ensure consistent order
+        dirs.sort()
+        files.sort()
+        for file in files:
+            if file.lower().endswith(('.pdf',)):
+                file_path = Path(root) / file
+                relative_path = file_path.relative_to(root_path)
+                pdf_files.append((str(file_path), str(relative_path)))
+
+    # Sort the final list by relative path to ensure consistent ordering
+    pdf_files.sort(key=lambda x: x[1])
+
+    return pdf_files
+
+
+def get_system_capacity() -> int:
+    """
+    Determine system capacity for batch processing based on available resources.
+    
+    Returns:
+        Number of files to process simultaneously
+    """
+    if HAS_PSUTIL:
+        try:
+            # Get system memory in GB
+            memory_gb = psutil.virtual_memory().total / (1024**3)
+            
+            # Get CPU count
+            cpu_count = psutil.cpu_count(logical=False) or 1
+            
+            # Conservative capacity calculation
+            # For pipeline backend: can handle more files (less memory intensive)
+            # For VLM backends: requires more memory per file
+            if memory_gb >= 16:
+                return min(cpu_count, 4)
+            elif memory_gb >= 8:
+                return min(cpu_count, 2)
+            else:
+                return 1
+        except Exception:
+            logger.warning("Failed to detect system resources, using conservative settings")
+            return 1
+    else:
+        # Fallback to conservative settings when psutil is not available
+        try:
+            cpu_count = os.cpu_count() or 1
+            return min(cpu_count, 2)
+        except:
+            return 1
+
+
+async def process_single_pdf_batch(pdf_info: Tuple[str, str], output_base_dir: str, processing_params: dict, tracker: BatchProcessingTracker = None, progress_callback=None):
+    """
+    Process a single PDF file while maintaining directory structure.
+
+    Args:
+        pdf_info: Tuple of (absolute_path, relative_path)
+        output_base_dir: Base output directory
+        processing_params: Dictionary containing processing parameters
+        tracker: BatchProcessingTracker instance for progress tracking
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        Tuple of (success: bool, file_path: str, error_message: str)
+    """
+    pdf_path, relative_path = pdf_info
+
+    # Update tracker with current file
+    if tracker:
+        tracker.update_current_file(pdf_path)
+        if progress_callback:
+            progress_callback(tracker.get_status_message())
+
+    try:
+        # Create output directory maintaining folder structure
+        relative_dir = os.path.dirname(relative_path)
+        output_subdir = os.path.join(output_base_dir, "MinerU_Outputs", relative_dir) if relative_dir else os.path.join(output_base_dir, "MinerU_Outputs")
+        
+        # Generate unique filename for this processing run
+        pdf_name = Path(pdf_path).stem
+        file_name = f'{safe_stem(pdf_name)}_{time.strftime("%y%m%d_%H%M%S")}'
+        
+        # Setup processing parameters
+        backend = processing_params.get('backend', 'pipeline')
+        parse_method = 'ocr' if processing_params.get('is_ocr', False) else 'auto'
+        if backend.startswith("vlm"):
+            parse_method = "vlm"
+
+        # Get MD-only and fast mode settings
+        md_only = processing_params.get('md_only', False)
+        fast_mode = processing_params.get('fast_mode', False)
+
+        # Apply MD-only and fast mode optimizations
+        formula_enable = processing_params.get('formula_enable', True)
+        table_enable = processing_params.get('table_enable', True)
+        images_enable = processing_params.get('images_enable', False)
+        csv_tables = processing_params.get('csv_tables', True)
+
+        if md_only:
+            # In MD-only mode, disable images to prevent images folder creation
+            images_enable = False
+
+        if fast_mode and md_only:
+            formula_enable = False
+            # table_enable remains unchanged - keep tables for better content extraction
+            # Additional fast mode optimizations can be added here
+
+        # For MD-only mode, override parse_method to be empty so prepare_env doesn't create subdirectory
+        if md_only:
+            actual_parse_method = ""
+        else:
+            actual_parse_method = parse_method
+
+        # Prepare environment - for batch processing, place files directly in output_subdir without parse_method folder
+        final_output_dir = os.path.join(output_subdir, file_name)
+        local_md_dir = final_output_dir
+
+        # Only create and use images directory if not in MD-only mode
+        if md_only:
+            local_image_dir = None
+        else:
+            local_image_dir = os.path.join(final_output_dir, "images")
+            os.makedirs(local_image_dir, exist_ok=True)
+
+        os.makedirs(local_md_dir, exist_ok=True)
+        
+        # Read PDF data
+        pdf_data = read_fn(pdf_path)
+
+        # Process the PDF
+        await aio_do_parse(
+            output_dir=output_subdir,
+            pdf_file_names=[file_name],
+            pdf_bytes_list=[pdf_data],
+            p_lang_list=[processing_params.get('language', 'en')],
+            parse_method=actual_parse_method,
+            end_page_id=processing_params.get('end_page_id', 999),
+            formula_enable=formula_enable,
+            table_enable=table_enable,
+            backend=backend,
+            server_url=processing_params.get('server_url'),
+            images_enable=images_enable,
+            # MD-only flags
+            f_draw_layout_bbox=not md_only,
+            f_draw_span_bbox=not md_only,
+            f_dump_md=True,  # Always generate MD
+            f_dump_middle_json=not md_only,
+            f_dump_model_output=not md_only,
+            f_dump_orig_pdf=not md_only,
+            f_dump_content_list=not md_only,
+        )
+
+        # Apply CSV table conversion if enabled
+        if csv_tables:
+            try:
+                md_file_path = os.path.join(local_md_dir, file_name + '.md')
+                if os.path.exists(md_file_path):
+                    with open(md_file_path, 'r', encoding='utf-8') as f:
+                        md_content = f.read()
+
+                    # Convert tables to CSV format
+                    converted_content = convert_tables_to_csv_in_markdown(md_content, csv_tables_enabled=True)
+
+                    # Write back the converted content
+                    with open(md_file_path, 'w', encoding='utf-8') as f:
+                        f.write(converted_content)
+            except Exception as e:
+                logger.warning(f"Failed to apply CSV table conversion: {e}")
+
+        # Mark as successful
+        if tracker:
+            tracker.mark_success(pdf_path)
+            if progress_callback:
+                progress_callback(tracker.get_status_message())
+
+        if progress_callback:
+            progress_callback(f"✓ Processed: {relative_path}")
+
+        return True, pdf_path, ""
+
+    except Exception as e:
+        error_msg = f"Error processing {relative_path}: {str(e)}"
+        logger.exception(error_msg)
+
+        # Move failed file to ERRORED folder
+        try:
+            error_file_path = move_file_to_error_folder(pdf_path, output_base_dir, relative_path)
+            if error_file_path:
+                error_msg += f" (copied to ERRORED folder)"
+        except Exception as move_error:
+            logger.warning(f"Failed to move error file: {move_error}")
+
+        # Mark as failed
+        if tracker:
+            tracker.mark_failure(pdf_path, str(e))
+            if progress_callback:
+                progress_callback(tracker.get_status_message())
+
+        if progress_callback:
+            progress_callback(f"✗ Failed: {relative_path} - {str(e)}")
+
+        return False, pdf_path, error_msg
+
+
+async def batch_process_directory(
+    input_dir: str,
+    output_dir: str,
+    max_pages: int = 10,
+    is_ocr: bool = False,
+    formula_enable: bool = True,
+    table_enable: bool = True,
+    images_enable: bool = False,
+    language: str = "en",
+    backend: str = "pipeline",
+    server_url: str = None,
+    md_only: bool = False,
+    fast_mode: bool = False,
+    csv_tables: bool = True,
+    progress_callback=None
+):
+    """
+    Batch process all PDFs in a directory while maintaining folder structure.
+    
+    Args:
+        input_dir: Input directory to scan for PDFs
+        output_dir: Output directory for processed files
+        Other parameters: Processing options
+        progress_callback: Optional callback for progress updates
+    
+    Returns:
+        Tuple of (total_files, successful_files, failed_files, results_zip_path)
+    """
+    try:
+        if progress_callback:
+            progress_callback("🔍 Scanning directory for PDF files...")
+        
+        # Scan for PDF files
+        pdf_files = scan_directory_for_pdfs(input_dir)
+        
+        if not pdf_files:
+            if progress_callback:
+                progress_callback("❌ No PDF files found in the specified directory")
+            return 0, 0, 0, None
+        
+        if progress_callback:
+            progress_callback(f"📁 Found {len(pdf_files)} PDF files")
+
+        # Initialize progress tracker
+        tracker = BatchProcessingTracker(len(pdf_files))
+
+        # Determine processing capacity
+        system_capacity = get_system_capacity()
+        if backend.startswith("vlm"):
+            # VLM backends are more memory intensive
+            batch_size = max(1, system_capacity // 2)
+        else:
+            batch_size = system_capacity
+        
+        if progress_callback:
+            progress_callback(f"🚀 Processing {batch_size} files at a time (system capacity: {system_capacity})")
+        
+        # Prepare processing parameters
+        processing_params = {
+            'backend': backend,
+            'is_ocr': is_ocr,
+            'language': language,
+            'end_page_id': max_pages - 1,
+            'formula_enable': formula_enable,
+            'table_enable': table_enable,
+            'images_enable': images_enable,
+            'server_url': server_url,
+            'md_only': md_only,
+            'fast_mode': fast_mode,
+            'csv_tables': csv_tables
+        }
+        
+        # Process files in batches
+        results = []
+
+        for i in range(0, len(pdf_files), batch_size):
+            batch = pdf_files[i:i + batch_size]
+
+            if progress_callback:
+                progress_callback(f"📄 Processing batch {i//batch_size + 1}/{(len(pdf_files) + batch_size - 1)//batch_size}")
+
+            # Process batch concurrently
+            tasks = [
+                process_single_pdf_batch(pdf_info, output_dir, processing_params, tracker, progress_callback)
+                for pdf_info in batch
+            ]
+
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Count results and handle exceptions
+            for j, result in enumerate(batch_results):
+                if isinstance(result, Exception):
+                    # Handle unexpected exceptions not caught by process_single_pdf_batch
+                    pdf_path, relative_path = batch[j]
+                    error_msg = str(result)
+                    tracker.mark_failure(pdf_path, error_msg)
+                    results.append((False, pdf_path, error_msg))
+
+                    # Try to move file to ERRORED folder
+                    try:
+                        move_file_to_error_folder(pdf_path, output_dir, relative_path)
+                    except Exception as move_error:
+                        logger.warning(f"Failed to move error file: {move_error}")
+                else:
+                    results.append(result)
+        
+        # Create results archive only if not MD-only mode
+        output_root = os.path.join(output_dir, "MinerU_Outputs")
+        archive_zip_path = None
+        if not md_only and os.path.exists(output_root):
+            archive_zip_path = os.path.join(output_dir, f'MinerU_batch_results_{time.strftime("%y%m%d_%H%M%S")}.zip')
+            compress_result = compress_directory_to_zip(output_root, archive_zip_path)
+
+            if compress_result == 0:
+                if progress_callback:
+                    progress_callback(f"📦 Created results archive: {archive_zip_path}")
+            else:
+                archive_zip_path = None
+        elif md_only and progress_callback:
+            progress_callback("📝 MD-only mode: No archive created")
+        
+        # Final status update
+        if progress_callback:
+            progress_callback(f"✅ Batch processing completed: {tracker.successful_files} successful, {tracker.failed_files} failed")
+
+            # Add error summary if there were failures
+            if tracker.failed_files > 0:
+                progress_callback("\n" + "="*50)
+                progress_callback(tracker.get_error_summary())
+
+        return len(pdf_files), tracker.successful_files, tracker.failed_files, archive_zip_path
+        
+    except Exception as e:
+        error_msg = f"Batch processing error: {str(e)}"
+        logger.exception(error_msg)
+        if progress_callback:
+            progress_callback(f"❌ {error_msg}")
+        return 0, 0, 1, None
+
+
+def validate_directory_path(dir_path: str) -> str:
+    """Validate and return directory path status."""
+    if not dir_path:
+        return "Please enter a directory path"
+    
+    if not os.path.exists(dir_path):
+        return "Directory does not exist"
+    
+    if not os.path.isdir(dir_path):
+        return "Path is not a directory"
+    
+    try:
+        # Check if we can scan the directory
+        pdf_files = scan_directory_for_pdfs(dir_path)
+        return f"✓ Directory is valid - Found {len(pdf_files)} PDF files"
+    except Exception as e:
+        return f"Error scanning directory: {str(e)}"
+
+
+def run_batch_processing(input_dir, output_dir, max_pages, is_ocr, formula_enable,
+                        table_enable, images_enable, csv_tables, language, backend, url, md_only, fast_mode):
+    """
+    Wrapper function to run batch processing from Gradio interface.
+    """
+    if not input_dir or not input_dir.strip():
+        return "❌ Please specify an input directory", None, "Processing failed - no input directory specified"
+    
+    if not output_dir or not output_dir.strip():
+        return "❌ Please specify an output directory", None, "Processing failed - no output directory specified"
+    
+    # Validate directories
+    input_status = validate_directory_path(input_dir.strip())
+    if not input_status.startswith("✓"):
+        return f"❌ Input directory error: {input_status}", None, "Processing failed - invalid input directory"
+    
+    # Create output directory if it doesn't exist
+    output_dir = output_dir.strip()
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        return f"❌ Cannot create output directory: {str(e)}", None, "Processing failed - cannot create output directory"
+    
+    # Create progress tracking
+    progress_messages = []
+
+    def progress_callback(message):
+        # Handle multi-line messages (like status updates and error summaries)
+        if isinstance(message, str):
+            for line in message.split('\n'):
+                if line.strip():  # Only add non-empty lines
+                    progress_messages.append(line.strip())
+        else:
+            progress_messages.append(str(message))
+
+        # Keep more messages to show full processing history
+        return "\n".join(progress_messages[-50:])  # Keep last 50 messages
+    
+    # Run the batch processing
+    try:
+        # Use asyncio to run the batch processing
+        import asyncio
+        
+        # Create event loop if none exists
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Run the batch processing
+        result = loop.run_until_complete(
+            batch_process_directory(
+                input_dir=input_dir.strip(),
+                output_dir=output_dir,
+                max_pages=max_pages,
+                is_ocr=is_ocr,
+                formula_enable=formula_enable,
+                table_enable=table_enable,
+                images_enable=images_enable,
+                language=language,
+                backend=backend,
+                server_url=url if url and url.strip() else None,
+                md_only=md_only,
+                fast_mode=fast_mode,
+                csv_tables=csv_tables,
+                progress_callback=progress_callback
+            )
+        )
+        
+        total_files, successful_files, failed_files, zip_path = result
+        
+        # Generate summary
+        if total_files == 0:
+            summary = "❌ No PDF files found in the specified directory"
+        else:
+            success_rate = (successful_files / total_files * 100) if total_files > 0 else 0
+            summary = f"✅ Batch processing completed:\n"
+            summary += f"• Total files: {total_files}\n"
+            summary += f"• Successful: {successful_files} ({success_rate:.1f}%)\n"
+            summary += f"• Failed: {failed_files}\n"
+            if zip_path:
+                summary += f"• Results archive: {os.path.basename(zip_path)}\n"
+            if failed_files > 0:
+                summary += f"• Failed files copied to: {os.path.join(output_dir, 'ERRORED')}\n"
+            summary += f"• Output directory: {os.path.join(output_dir, 'MinerU_Outputs')}"
+        
+        progress_text = "\n".join(progress_messages)
+        
+        return summary, zip_path, progress_text
+        
+    except Exception as e:
+        error_msg = f"❌ Batch processing failed: {str(e)}"
+        logger.exception(error_msg)
+        return error_msg, None, "\n".join(progress_messages) + f"\n{error_msg}"
 
 
 # 更新界面函数
@@ -279,55 +1062,217 @@ def main(ctx,
     suffixes = pdf_suffixes + image_suffixes
     with gr.Blocks() as demo:
         gr.HTML(header)
-        with gr.Row():
-            with gr.Column(variant='panel', scale=5):
+        
+        with gr.Tabs():
+            # Single File Processing Tab
+            with gr.Tab("Single File"):
                 with gr.Row():
-                    input_file = gr.File(label='Please upload a PDF or image', file_types=suffixes)
+                    with gr.Column(variant='panel', scale=5):
+                        with gr.Row():
+                            input_file = gr.File(label='Please upload a PDF or image', file_types=suffixes)
+                        with gr.Row():
+                            max_pages = gr.Slider(1, max_convert_pages, int(max_convert_pages/2), step=1, label='Max convert pages')
+                        with gr.Row():
+                            if sglang_engine_enable:
+                                drop_list = ["pipeline", "vlm-sglang-engine"]
+                                preferred_option = "vlm-sglang-engine"
+                            else:
+                                drop_list = ["pipeline", "vlm-transformers", "vlm-sglang-client"]
+                                preferred_option = "pipeline"
+                            backend = gr.Dropdown(drop_list, label="Backend", value=preferred_option)
+                        with gr.Row(visible=False) as client_options:
+                            url = gr.Textbox(label='Server URL', value='http://localhost:30000', placeholder='http://localhost:30000')
+                        with gr.Row(equal_height=True):
+                            with gr.Column():
+                                gr.Markdown("**Recognition Options:**")
+                                formula_enable = gr.Checkbox(label='Enable formula recognition', value=True)
+                                table_enable = gr.Checkbox(label='Enable table recognition', value=True)
+                                images_enable = gr.Checkbox(label='Enable images in markdown output', value=False)
+                                csv_tables = gr.Checkbox(label='📊 Convert tables to CSV format', value=True)
+                            with gr.Column():
+                                gr.Markdown("**Output Options:**")
+                                md_only = gr.Checkbox(label='Output markdown only (no PDFs, JSONs, images)', value=True)
+                                fast_mode = gr.Checkbox(label='🚀 Fast mode (disable formula recognition when MD-only)', value=True)
+                                gr.Markdown("*Fast mode automatically disables formula recognition when MD-only is enabled for faster processing. Table recognition remains enabled for better content extraction.*", elem_classes=["text-sm", "text-gray-600"])
+                            with gr.Column(visible=False) as ocr_options:
+                                language = gr.Dropdown(all_lang, label='Language', value='en')
+                                is_ocr = gr.Checkbox(label='Force enable OCR', value=False)
+                        with gr.Row():
+                            change_bu = gr.Button('Convert')
+                            clear_bu = gr.ClearButton(value='Clear')
+                        pdf_show = PDF(label='PDF preview', interactive=False, visible=True, height=800)
+                        if example_enable:
+                            example_root = os.path.join(os.getcwd(), 'examples')
+                            if os.path.exists(example_root):
+                                with gr.Accordion('Examples:'):
+                                    gr.Examples(
+                                        examples=[os.path.join(example_root, _) for _ in os.listdir(example_root) if
+                                                  _.endswith(tuple(suffixes))],
+                                        inputs=input_file
+                                    )
+
+                    with gr.Column(variant='panel', scale=5):
+                        output_file = gr.File(label='convert result', interactive=False)
+                        with gr.Tabs():
+                            with gr.Tab('Markdown rendering'):
+                                md = gr.Markdown(label='Markdown rendering', height=1100, show_copy_button=True,
+                                                 latex_delimiters=latex_delimiters,
+                                                 line_breaks=True)
+                            with gr.Tab('Markdown text'):
+                                md_text = gr.TextArea(lines=45, show_copy_button=True)
+            
+            # Batch Processing Tab
+            with gr.Tab("Batch Processing"):
                 with gr.Row():
-                    max_pages = gr.Slider(1, max_convert_pages, int(max_convert_pages/2), step=1, label='Max convert pages')
-                with gr.Row():
-                    if sglang_engine_enable:
-                        drop_list = ["pipeline", "vlm-sglang-engine"]
-                        preferred_option = "vlm-sglang-engine"
-                    else:
-                        drop_list = ["pipeline", "vlm-transformers", "vlm-sglang-client"]
-                        preferred_option = "pipeline"
-                    backend = gr.Dropdown(drop_list, label="Backend", value=preferred_option)
-                with gr.Row(visible=False) as client_options:
-                    url = gr.Textbox(label='Server URL', value='http://localhost:30000', placeholder='http://localhost:30000')
-                with gr.Row(equal_height=True):
-                    with gr.Column():
-                        gr.Markdown("**Recognition Options:**")
-                        formula_enable = gr.Checkbox(label='Enable formula recognition', value=True)
-                        table_enable = gr.Checkbox(label='Enable table recognition', value=True)
-                    with gr.Column(visible=False) as ocr_options:
-                        language = gr.Dropdown(all_lang, label='Language', value='ch')
-                        is_ocr = gr.Checkbox(label='Force enable OCR', value=False)
-                with gr.Row():
-                    change_bu = gr.Button('Convert')
-                    clear_bu = gr.ClearButton(value='Clear')
-                pdf_show = PDF(label='PDF preview', interactive=False, visible=True, height=800)
-                if example_enable:
-                    example_root = os.path.join(os.getcwd(), 'examples')
-                    if os.path.exists(example_root):
-                        with gr.Accordion('Examples:'):
-                            gr.Examples(
-                                examples=[os.path.join(example_root, _) for _ in os.listdir(example_root) if
-                                          _.endswith(tuple(suffixes))],
-                                inputs=input_file
+                    with gr.Column(variant='panel', scale=5):
+                        gr.Markdown("## Batch Directory Processing")
+                        gr.Markdown("Process all PDF files in a directory while maintaining folder structure.")
+                        
+                        with gr.Row():
+                            batch_input_dir = gr.Textbox(
+                                label='Input Directory Path',
+                                placeholder='Enter the path to directory containing PDF files (e.g., C:\\Documents\\PDFs)',
+                                lines=1
                             )
+                        with gr.Row():
+                            batch_output_dir = gr.Textbox(
+                                label='Output Directory Path',
+                                placeholder='Enter the path where processed files will be saved (e.g., C:\\Documents\\Output)',
+                                lines=1
+                            )
+                        with gr.Row():
+                            dir_status = gr.Textbox(
+                                label='Directory Status',
+                                interactive=False,
+                                lines=2
+                            )
+                        with gr.Row():
+                            validate_btn = gr.Button('Validate Directories', variant='secondary')
+                        
+                        with gr.Row():
+                            batch_max_pages = gr.Slider(1, max_convert_pages, int(max_convert_pages/2), step=1, label='Max convert pages')
+                        with gr.Row():
+                            if sglang_engine_enable:
+                                batch_drop_list = ["pipeline", "vlm-sglang-engine"]
+                                batch_preferred_option = "vlm-sglang-engine"
+                            else:
+                                batch_drop_list = ["pipeline", "vlm-transformers", "vlm-sglang-client"]
+                                batch_preferred_option = "pipeline"
+                            batch_backend = gr.Dropdown(batch_drop_list, label="Backend", value=batch_preferred_option)
+                        with gr.Row(visible=False) as batch_client_options:
+                            batch_url = gr.Textbox(label='Server URL', value='http://localhost:30000', placeholder='http://localhost:30000')
+                        with gr.Row(equal_height=True):
+                            with gr.Column():
+                                gr.Markdown("**Recognition Options:**")
+                                batch_formula_enable = gr.Checkbox(label='Enable formula recognition', value=True)
+                                batch_table_enable = gr.Checkbox(label='Enable table recognition', value=True)
+                                batch_images_enable = gr.Checkbox(label='Enable images in markdown output', value=False)
+                                batch_csv_tables = gr.Checkbox(label='📊 Convert tables to CSV format', value=True)
+                            with gr.Column():
+                                gr.Markdown("**Output Options:**")
+                                batch_md_only = gr.Checkbox(label='Output markdown only (no PDFs, JSONs, images)', value=True)
+                                batch_fast_mode = gr.Checkbox(label='🚀 Fast mode (disable formula recognition when MD-only)', value=True)
+                                gr.Markdown("*Fast mode automatically disables formula recognition when MD-only is enabled for faster processing. Table recognition remains enabled for better content extraction.*", elem_classes=["text-sm", "text-gray-600"])
+                            with gr.Column(visible=False) as batch_ocr_options:
+                                batch_language = gr.Dropdown(all_lang, label='Language', value='en')
+                                batch_is_ocr = gr.Checkbox(label='Force enable OCR', value=False)
+                        
+                        with gr.Row():
+                            batch_process_btn = gr.Button('Start Batch Processing', variant='primary', size='lg')
+                            batch_clear_btn = gr.ClearButton(value='Clear', variant='secondary')
+                        
+                        gr.Markdown("**Note:** Processing will create a 'MinerU_Outputs' subdirectory in your output path with the same folder structure as your input directory. Failed files will be copied to an 'ERRORED' folder for troubleshooting.")
+                    
+                    with gr.Column(variant='panel', scale=5):
+                        batch_summary = gr.Textbox(
+                            label='Processing Summary',
+                            interactive=False,
+                            lines=8
+                        )
+                        batch_output_file = gr.File(label='Results Archive', interactive=False)
+                        batch_progress = gr.TextArea(
+                            label='Processing Progress',
+                            lines=25,
+                            autoscroll=True,
+                            show_copy_button=True
+                        )
 
-            with gr.Column(variant='panel', scale=5):
-                output_file = gr.File(label='convert result', interactive=False)
-                with gr.Tabs():
-                    with gr.Tab('Markdown rendering'):
-                        md = gr.Markdown(label='Markdown rendering', height=1100, show_copy_button=True,
-                                         latex_delimiters=latex_delimiters,
-                                         line_breaks=True)
-                    with gr.Tab('Markdown text'):
-                        md_text = gr.TextArea(lines=45, show_copy_button=True)
+        # Function to handle batch interface updates
+        def update_batch_interface(backend_choice):
+            if backend_choice in ["vlm-transformers", "vlm-sglang-engine"]:
+                return gr.update(visible=False), gr.update(visible=False)
+            elif backend_choice in ["vlm-sglang-client"]:
+                return gr.update(visible=True), gr.update(visible=False)
+            elif backend_choice in ["pipeline"]:
+                return gr.update(visible=False), gr.update(visible=True)
+            else:
+                return gr.update(visible=False), gr.update(visible=False)
+        
+        # Function to validate directory paths
+        def validate_directories(input_dir, output_dir):
+            messages = []
+            if input_dir:
+                input_status = validate_directory_path(input_dir.strip())
+                messages.append(f"Input: {input_status}")
+            else:
+                messages.append("Input: Please enter input directory path")
 
-        # 添加事件处理
+            if output_dir:
+                if os.path.exists(output_dir.strip()):
+                    if os.path.isdir(output_dir.strip()):
+                        messages.append("Output: ✓ Directory exists and is valid")
+                    else:
+                        messages.append("Output: Path exists but is not a directory")
+                else:
+                    messages.append("Output: Directory will be created")
+            else:
+                messages.append("Output: Please enter output directory path")
+
+            return "\n".join(messages)
+
+        # Function to handle fast mode toggle for single file processing
+        def handle_fast_mode_single(md_only_val, fast_mode_val):
+            if fast_mode_val and md_only_val:
+                # Fast mode enabled with MD-only: disable formula recognition but keep tables
+                return (gr.update(value=False), gr.update(), gr.update(value=False, interactive=False))  # formula_enable disabled, table_enable unchanged, images_enable disabled
+            elif md_only_val:
+                # MD-only mode: disable images but allow manual control of formula/table
+                return (gr.update(), gr.update(), gr.update(value=False, interactive=False))  # images_enable disabled
+            else:
+                # Normal mode: enable all controls
+                return (gr.update(), gr.update(), gr.update(interactive=True))
+
+        # Function to handle MD-only toggle for single file processing
+        def handle_md_only_single(md_only_val):
+            if md_only_val:
+                # MD-only mode: disable images
+                return gr.update(value=False, interactive=False)  # images_enable
+            else:
+                # Normal mode: enable images control
+                return gr.update(interactive=True)
+
+        # Function to handle fast mode toggle for batch processing
+        def handle_fast_mode_batch(md_only_val, fast_mode_val):
+            if fast_mode_val and md_only_val:
+                # Fast mode enabled with MD-only: disable formula recognition but keep tables
+                return (gr.update(value=False), gr.update(), gr.update(value=False, interactive=False))  # batch_formula_enable disabled, batch_table_enable unchanged, batch_images_enable disabled
+            elif md_only_val:
+                # MD-only mode: disable images but allow manual control of formula/table
+                return (gr.update(), gr.update(), gr.update(value=False, interactive=False))  # batch_images_enable disabled
+            else:
+                # Normal mode: enable all controls
+                return (gr.update(), gr.update(), gr.update(interactive=True))
+
+        # Function to handle MD-only toggle for batch processing
+        def handle_md_only_batch(md_only_val):
+            if md_only_val:
+                # MD-only mode: disable images
+                return gr.update(value=False, interactive=False)  # batch_images_enable
+            else:
+                # Normal mode: enable images control
+                return gr.update(interactive=True)
+
+        # 添加事件处理 - Single File Tab
         backend.change(
             fn=update_interface,
             inputs=[backend],
@@ -341,18 +1286,99 @@ def main(ctx,
             outputs=[client_options, ocr_options],
             api_name=False
         )
-        clear_bu.add([input_file, md, pdf_show, md_text, output_file, is_ocr])
+
+        # Single file fast mode handlers
+        fast_mode.change(
+            fn=handle_fast_mode_single,
+            inputs=[md_only, fast_mode],
+            outputs=[formula_enable, table_enable, images_enable],
+            api_name=False
+        )
+
+        md_only.change(
+            fn=handle_fast_mode_single,
+            inputs=[md_only, fast_mode],
+            outputs=[formula_enable, table_enable, images_enable],
+            api_name=False
+        )
+        clear_bu.add([input_file, md, pdf_show, md_text, output_file, is_ocr, md_only, fast_mode, formula_enable, table_enable, images_enable, csv_tables])
+
+        # Batch Processing Tab Event Handlers
+        batch_backend.change(
+            fn=update_batch_interface,
+            inputs=[batch_backend],
+            outputs=[batch_client_options, batch_ocr_options],
+            api_name=False
+        )
+        
+        # Directory validation
+        validate_btn.click(
+            fn=validate_directories,
+            inputs=[batch_input_dir, batch_output_dir],
+            outputs=[dir_status],
+            api_name=False
+        )
+        
+        # Auto-validate on directory input change
+        batch_input_dir.change(
+            fn=validate_directories,
+            inputs=[batch_input_dir, batch_output_dir],
+            outputs=[dir_status],
+            api_name=False
+        )
+        
+        batch_output_dir.change(
+            fn=validate_directories,
+            inputs=[batch_input_dir, batch_output_dir],
+            outputs=[dir_status],
+            api_name=False
+        )
+
+        # Batch processing fast mode handlers
+        batch_fast_mode.change(
+            fn=handle_fast_mode_batch,
+            inputs=[batch_md_only, batch_fast_mode],
+            outputs=[batch_formula_enable, batch_table_enable, batch_images_enable],
+            api_name=False
+        )
+
+        batch_md_only.change(
+            fn=handle_fast_mode_batch,
+            inputs=[batch_md_only, batch_fast_mode],
+            outputs=[batch_formula_enable, batch_table_enable, batch_images_enable],
+            api_name=False
+        )
+        
+        # Clear button for batch processing
+        batch_clear_btn.add([
+            batch_input_dir, batch_output_dir, dir_status, batch_summary,
+            batch_output_file, batch_progress, batch_is_ocr, batch_md_only, batch_fast_mode,
+            batch_formula_enable, batch_table_enable, batch_images_enable, batch_csv_tables
+        ])
 
         if api_enable:
             api_name = None
         else:
             api_name = False
 
+        # Single file processing
         input_file.change(fn=to_pdf, inputs=input_file, outputs=pdf_show, api_name=api_name)
         change_bu.click(
             fn=to_markdown,
-            inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, language, backend, url],
+            inputs=[input_file, max_pages, is_ocr, formula_enable, table_enable, language, backend, url, images_enable, md_only, fast_mode, csv_tables],
             outputs=[md, md_text, output_file, pdf_show],
+            api_name=api_name
+        )
+        
+        # Batch processing
+        batch_process_btn.click(
+            fn=run_batch_processing,
+            inputs=[
+                batch_input_dir, batch_output_dir, batch_max_pages, batch_is_ocr,
+                batch_formula_enable, batch_table_enable, batch_images_enable, batch_csv_tables,
+                batch_language, batch_backend, batch_url, batch_md_only, batch_fast_mode
+            ],
+            outputs=[batch_summary, batch_output_file, batch_progress],
             api_name=api_name
         )
 

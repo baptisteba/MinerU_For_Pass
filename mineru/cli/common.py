@@ -100,7 +100,8 @@ def _process_output(
         f_make_md_mode,
         middle_json,
         model_output=None,
-        is_pipeline=True
+        is_pipeline=True,
+        images_enable=False,
 ):
     f_draw_line_sort_bbox = False
     from mineru.backend.pipeline.pipeline_middle_json_mkcontent import union_make as pipeline_union_make
@@ -124,7 +125,7 @@ def _process_output(
 
     if f_dump_md:
         make_func = pipeline_union_make if is_pipeline else vlm_union_make
-        md_content_str = make_func(pdf_info, f_make_md_mode, image_dir)
+        md_content_str = make_func(pdf_info, f_make_md_mode, image_dir, images_enable)
         md_writer.write_string(
             f"{pdf_file_name}.md",
             md_content_str,
@@ -132,7 +133,7 @@ def _process_output(
 
     if f_dump_content_list:
         make_func = pipeline_union_make if is_pipeline else vlm_union_make
-        content_list = make_func(pdf_info, MakeMode.CONTENT_LIST, image_dir)
+        content_list = make_func(pdf_info, MakeMode.CONTENT_LIST, image_dir, images_enable)
         md_writer.write_string(
             f"{pdf_file_name}_content_list.json",
             json.dumps(content_list, ensure_ascii=False, indent=4),
@@ -176,6 +177,7 @@ def _process_pipeline(
         f_dump_orig_pdf,
         f_dump_content_list,
         f_make_md_mode,
+        images_enable=False,
 ):
     """处理pipeline后端逻辑"""
     from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json as pipeline_result_to_middle_json
@@ -211,7 +213,7 @@ def _process_pipeline(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, model_json, is_pipeline=True
+            f_make_md_mode, middle_json, model_json, is_pipeline=True, images_enable=images_enable
         )
 
 
@@ -229,6 +231,7 @@ async def _async_process_vlm(
         f_dump_content_list,
         f_make_md_mode,
         server_url=None,
+        images_enable=False,
         **kwargs,
 ):
     """异步处理VLM后端逻辑"""
@@ -252,7 +255,7 @@ async def _async_process_vlm(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, is_pipeline=False
+            f_make_md_mode, middle_json, infer_result, is_pipeline=False, images_enable=images_enable
         )
 
 
@@ -270,6 +273,7 @@ def _process_vlm(
         f_dump_content_list,
         f_make_md_mode,
         server_url=None,
+        images_enable=False,
         **kwargs,
 ):
     """同步处理VLM后端逻辑"""
@@ -293,7 +297,7 @@ def _process_vlm(
             pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
             md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
             f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, is_pipeline=False
+            f_make_md_mode, middle_json, infer_result, is_pipeline=False, images_enable=images_enable
         )
 
 
@@ -317,6 +321,7 @@ def do_parse(
         f_make_md_mode=MakeMode.MM_MD,
         start_page_id=0,
         end_page_id=None,
+        images_enable=False,
         **kwargs,
 ):
     # 预处理PDF字节数据
@@ -327,7 +332,7 @@ def do_parse(
             output_dir, pdf_file_names, pdf_bytes_list, p_lang_list,
             parse_method, formula_enable, table_enable,
             f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
-            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode
+            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode, images_enable
         )
     else:
         if backend.startswith("vlm-"):
@@ -340,7 +345,7 @@ def do_parse(
             output_dir, pdf_file_names, pdf_bytes_list, backend,
             f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
             f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-            server_url, **kwargs,
+            server_url, images_enable, **kwargs,
         )
 
 
@@ -364,6 +369,7 @@ async def aio_do_parse(
         f_make_md_mode=MakeMode.MM_MD,
         start_page_id=0,
         end_page_id=None,
+        images_enable=False,
         **kwargs,
 ):
     # 预处理PDF字节数据
@@ -375,7 +381,7 @@ async def aio_do_parse(
             output_dir, pdf_file_names, pdf_bytes_list, p_lang_list,
             parse_method, formula_enable, table_enable,
             f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
-            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode
+            f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode, images_enable
         )
     else:
         if backend.startswith("vlm-"):
@@ -388,7 +394,7 @@ async def aio_do_parse(
             output_dir, pdf_file_names, pdf_bytes_list, backend,
             f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
             f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
-            server_url, **kwargs,
+            server_url, images_enable, **kwargs,
         )
 
 

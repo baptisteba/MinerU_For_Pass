@@ -63,7 +63,7 @@ def get_infer_result(file_suffix_identifier: str, pdf_name: str, parse_dir: str)
 async def parse_pdf(
         files: List[UploadFile] = File(...),
         output_dir: str = Form("./output"),
-        lang_list: List[str] = Form(["ch"]),
+        lang_list: List[str] = Form(["en"]),
         backend: str = Form("pipeline"),
         parse_method: str = Form("auto"),
         formula_enable: bool = Form(True),
@@ -77,6 +77,7 @@ async def parse_pdf(
         response_format_zip: bool = Form(False),
         start_page_id: int = Form(0),
         end_page_id: int = Form(99999),
+        images_enable: bool = Form(False),
 ):
 
     # 获取命令行配置参数
@@ -123,7 +124,7 @@ async def parse_pdf(
         actual_lang_list = lang_list
         if len(actual_lang_list) != len(pdf_file_names):
             # 如果语言列表长度不匹配，使用第一个语言或默认"ch"
-            actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(pdf_file_names)
+            actual_lang_list = [actual_lang_list[0] if actual_lang_list else "en"] * len(pdf_file_names)
 
         # 调用异步处理函数
         await aio_do_parse(
@@ -145,6 +146,7 @@ async def parse_pdf(
             f_dump_content_list=return_content_list,
             start_page_id=start_page_id,
             end_page_id=end_page_id,
+            images_enable=images_enable,
             **config
         )
 
