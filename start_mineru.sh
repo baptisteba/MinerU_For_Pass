@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Default configuration
-DEFAULT_VENV_PATH="./.venv"
+DEFAULT_VENV_PATH="./venv"
 DEFAULT_HOST="0.0.0.0"
 DEFAULT_WEB_PORT="7860"
 DEFAULT_API_PORT="8000"
@@ -60,6 +60,34 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to check system requirements for Ubuntu 24.04
+check_system_requirements() {
+    # Check if we're on Ubuntu
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        if [[ "$ID" == "ubuntu" ]]; then
+            print_status "Detected Ubuntu $VERSION_ID"
+
+            # Check for python3-venv package
+            if ! dpkg -l | grep -q python3.*-venv; then
+                print_warning "python3-venv package may not be installed"
+                print_warning "If you encounter venv issues, run: sudo apt install python3.12-venv"
+            fi
+        fi
+    fi
+}
+
+# Function to verify models are downloaded
+check_models() {
+    local config_file="$HOME/mineru.json"
+    if [ ! -f "$config_file" ]; then
+        print_warning "MinerU configuration not found at $config_file"
+        print_warning "Models may not be downloaded. Run: mineru-models-download"
+        return 1
+    fi
+    print_status "MinerU configuration found"
+}
+
 # Function to show help
 show_help() {
     echo "MinerU Startup Script"
@@ -73,7 +101,7 @@ show_help() {
     echo "  all                 Start all services (web + api)"
     echo ""
     echo "Options:"
-    echo "  --venv-path PATH    Path to virtual environment (default: ./.venv)"
+    echo "  --venv-path PATH    Path to virtual environment (default: ./venv)"
     echo "  --host HOST         Host to bind to (default: $DEFAULT_HOST)"
     echo "  --web-port PORT     Web UI port (default: $DEFAULT_WEB_PORT)"
     echo "  --api-port PORT     API server port (default: $DEFAULT_API_PORT)"
@@ -161,6 +189,9 @@ fi
 
 print_header
 
+# Check system requirements
+check_system_requirements
+
 # Activate virtual environment
 activate_venv "$VENV_PATH"
 
@@ -169,6 +200,9 @@ if ! command_exists mineru-gradio; then
     print_error "MinerU commands not found. Make sure MinerU is installed in the virtual environment."
     exit 1
 fi
+
+# Check if models are downloaded
+check_models
 
 # Function to start web UI
 start_web() {
