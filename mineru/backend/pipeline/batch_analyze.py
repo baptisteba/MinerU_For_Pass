@@ -189,7 +189,28 @@ class BatchAnalyze:
             wireless_table_model = atom_model_manager.get_atom_model(
                 atom_model_name=AtomicModel.WirelessTable,
             )
-            wireless_table_model.batch_predict(table_res_list_all_page)
+
+            # Safer table processing with error handling
+            try:
+                # Process tables in smaller batches to avoid memory issues
+                batch_size = max(1, min(10, len(table_res_list_all_page) // 4))
+
+                for i in range(0, len(table_res_list_all_page), batch_size):
+                    batch = table_res_list_all_page[i:i+batch_size]
+                    try:
+                        wireless_table_model.batch_predict(batch)
+                    except Exception as e:
+                        logger.warning(f"Wireless table batch {i//batch_size + 1} failed: {e}, using fallback")
+                        # Provide fallback for failed tables
+                        for item in batch:
+                            if 'html' not in item.get('table_res', {}):
+                                item['table_res']['html'] = '<table><tr><td>Table processing failed</td></tr></table>'
+            except Exception as e:
+                logger.error(f"Wireless table processing completely failed: {e}")
+                # Provide fallback for all tables
+                for item in table_res_list_all_page:
+                    if 'html' not in item.get('table_res', {}):
+                        item['table_res']['html'] = '<table><tr><td>Table processing failed</td></tr></table>'
 
             # 单独拿出有线表格进行预测
             wired_table_res_list = []
@@ -209,15 +230,21 @@ class BatchAnalyze:
                     if not table_res_dict.get("ocr_result", None):
                         continue
 
-                    wired_table_model = atom_model_manager.get_atom_model(
-                        atom_model_name=AtomicModel.WiredTable,
-                        lang=table_res_dict["lang"],
-                    )
-                    table_res_dict["table_res"]["html"] = wired_table_model.predict(
-                        table_res_dict["wired_table_img"],
-                        table_res_dict["ocr_result"],
-                        table_res_dict["table_res"].get("html", None)
-                    )
+                    try:
+                        wired_table_model = atom_model_manager.get_atom_model(
+                            atom_model_name=AtomicModel.WiredTable,
+                            lang=table_res_dict["lang"],
+                        )
+                        table_res_dict["table_res"]["html"] = wired_table_model.predict(
+                            table_res_dict["wired_table_img"],
+                            table_res_dict["ocr_result"],
+                            table_res_dict["table_res"].get("html", None)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Wired table prediction failed: {e}, using wireless result")
+                        # Keep the wireless result if wired processing fails
+                        if not table_res_dict["table_res"].get("html"):
+                            table_res_dict["table_res"]["html"] = '<table><tr><td>Table processing failed</td></tr></table>'
 
             # 表格格式清理
             for table_res_dict in table_res_list_all_page:

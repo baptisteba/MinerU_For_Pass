@@ -89,7 +89,12 @@ class WiredTableRecognition:
                 )
             cell_box_det_map, not_match_orc_boxes = match_ocr_cell(ocr_result, polygons)
             # 如果有识别框没有ocr结果，直接进行rec补充
-            cell_box_det_map = self.fill_blank_rec(img, polygons, cell_box_det_map)
+            try:
+                cell_box_det_map = self.fill_blank_rec(img, polygons, cell_box_det_map)
+            except ZeroDivisionError as e:
+                logger.warning(f"ZeroDivisionError in fill_blank_rec: {e}, using partial results")
+            except Exception as e:
+                logger.error(f"Error in fill_blank_rec: {e}, using partial results")
             # 转换为中间格式，修正识别框坐标,将物理识别框，逻辑识别框，ocr识别框整合为dict，方便后续处理
             t_rec_ocr_list = self.transform_res(cell_box_det_map, polygons, logi_points)
             # 将每个单元格中的ocr识别结果排序和同行合并，输出的html能完整保留文字的换行格式
@@ -105,9 +110,14 @@ class WiredTableRecognition:
             logi_points = np.array(logi_points)
             elapse = time.perf_counter() - s
 
-        except Exception:
+        except ZeroDivisionError as e:
+            logging.error(f"ZeroDivisionError in table processing: {e}")
             logging.warning(traceback.format_exc())
-            return WiredTableOutput("", None, None, 0.0)
+            return WiredTableOutput("<table><tr><td>Table processing failed: Division by zero</td></tr></table>", None, None, 0.0)
+        except Exception as e:
+            logging.error(f"Unexpected error in table processing: {e}")
+            logging.warning(traceback.format_exc())
+            return WiredTableOutput("<table><tr><td>Table processing failed</td></tr></table>", None, None, 0.0)
         return WiredTableOutput(pred_html, polygons, logi_points, elapse)
 
     def transform_res(
@@ -195,8 +205,26 @@ class WiredTableRecognition:
             img_crop_info_list.append([i, box])
 
         if len(img_crop_list) > 0:
+            # Validate images before OCR to avoid zero-dimension errors
+            valid_img_crop_list = []
+            valid_indices = []
+            for idx, img in enumerate(img_crop_list):
+                if img is not None and len(img.shape) >= 2 and img.shape[0] > 0 and img.shape[1] > 0:
+                    valid_img_crop_list.append(img)
+                    valid_indices.append(idx)
+                else:
+                    logger.warning(f"Skipping invalid image crop at index {idx} with shape: {img.shape if img is not None else 'None'}")
+
+            if len(valid_img_crop_list) == 0:
+                logger.warning("No valid image crops for OCR processing")
+                return cell_box_map
+
             # 进行ocr识别
-            ocr_result = self.ocr_engine.ocr(img_crop_list, det=False)
+            try:
+                ocr_result = self.ocr_engine.ocr(valid_img_crop_list, det=False)
+            except Exception as e:
+                logger.error(f"OCR processing failed: {e}")
+                return cell_box_map
             # ocr_result = [[]]
             # for crop_img in img_crop_list:
             #     tmp_ocr_result = self.ocr_engine.ocr(crop_img)
@@ -209,11 +237,23 @@ class WiredTableRecognition:
                 logger.warning("OCR engine returned no results or invalid result for image crops.")
                 return cell_box_map
             ocr_res_list = ocr_result[0]
-            if not isinstance(ocr_res_list, list) or len(ocr_res_list) != len(img_crop_list):
-                logger.warning("OCR result list length does not match image crop list length.")
+            if not isinstance(ocr_res_list, list) or len(ocr_res_list) != len(valid_img_crop_list):
+                logger.warning(f"OCR result list length ({len(ocr_res_list)}) does not match valid image crop list length ({len(valid_img_crop_list)}).")
                 return cell_box_map
-            for j, ocr_res in enumerate(ocr_res_list):
-                img_crop_info_list[j].append(ocr_res)
+
+            # Map OCR results back to original indices
+            ocr_results_map = {}
+            for ocr_idx, ocr_res in enumerate(ocr_res_list):
+                original_index = valid_indices[ocr_idx]
+                ocr_results_map[original_index] = ocr_res
+
+            # Add OCR results to img_crop_info_list, using empty result for invalid images
+            for j in range(len(img_crop_info_list)):
+                if j in ocr_results_map:
+                    img_crop_info_list[j].append(ocr_results_map[j])
+                else:
+                    # Add empty result for images that were filtered out
+                    img_crop_info_list[j].append(("", 0.0))
 
             for i, box, ocr_res in img_crop_info_list:
                 # 处理ocr结果

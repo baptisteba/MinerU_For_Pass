@@ -33,10 +33,11 @@ def read_fn(path):
             raise Exception(f"Unknown file suffix: {path.suffix}")
 
 
-def prepare_env(output_dir, pdf_file_name, parse_method):
+def prepare_env(output_dir, pdf_file_name, parse_method, create_images_dir=True):
     local_md_dir = str(os.path.join(output_dir, pdf_file_name, parse_method))
     local_image_dir = os.path.join(str(local_md_dir), "images")
-    os.makedirs(local_image_dir, exist_ok=True)
+    if create_images_dir:
+        os.makedirs(local_image_dir, exist_ok=True)
     os.makedirs(local_md_dir, exist_ok=True)
     return local_image_dir, local_md_dir
 
@@ -193,7 +194,7 @@ def _process_pipeline(
     for idx, model_list in enumerate(infer_results):
         model_json = copy.deepcopy(model_list)
         pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method, create_images_dir=images_enable)
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
 
         images_list = all_image_lists[idx]
@@ -242,7 +243,7 @@ async def _async_process_vlm(
 
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method, create_images_dir=images_enable)
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
 
         middle_json, infer_result = await aio_vlm_doc_analyze(
@@ -284,7 +285,7 @@ def _process_vlm(
 
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method, create_images_dir=images_enable)
         image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
 
         middle_json, infer_result = vlm_doc_analyze(

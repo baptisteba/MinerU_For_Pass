@@ -26,6 +26,7 @@ except ImportError:
     logger.warning("BeautifulSoup not available. HTML to CSV conversion will use basic regex parsing.")
 
 from mineru.cli.common import prepare_env, read_fn, aio_do_parse, pdf_suffixes, image_suffixes
+from mineru.cli.crash_recovery import ProcessingCheckpoint, SafeProcessor
 from mineru.utils.cli_parser import arg_parse
 from mineru.utils.hash_utils import str_sha256
 
@@ -165,7 +166,7 @@ async def parse_pdf(doc_path, output_dir, end_page_id, is_ocr, formula_enable, t
             local_image_dir = None
         else:
             # Use standard environment preparation for full output
-            local_image_dir, local_md_dir = prepare_env(output_dir, file_name, parse_method)
+            local_image_dir, local_md_dir = prepare_env(output_dir, file_name, parse_method, create_images_dir=images_enable)
             actual_parse_method = parse_method
 
         await aio_do_parse(
@@ -620,8 +621,8 @@ async def process_single_pdf_batch(pdf_info: Tuple[str, str], output_base_dir: s
         final_output_dir = os.path.join(output_subdir, file_name)
         local_md_dir = final_output_dir
 
-        # Only create and use images directory if not in MD-only mode
-        if md_only:
+        # Only create and use images directory if images are enabled (not in MD-only or fast mode)
+        if md_only or not images_enable:
             local_image_dir = None
         else:
             local_image_dir = os.path.join(final_output_dir, "images")
@@ -721,30 +722,56 @@ async def batch_process_directory(
     md_only: bool = False,
     fast_mode: bool = False,
     csv_tables: bool = True,
-    progress_callback=None
+    progress_callback=None,
+    resume_checkpoint: Optional[str] = None
 ):
     """
     Batch process all PDFs in a directory while maintaining folder structure.
-    
+
     Args:
         input_dir: Input directory to scan for PDFs
         output_dir: Output directory for processed files
         Other parameters: Processing options
         progress_callback: Optional callback for progress updates
-    
+        resume_checkpoint: Optional checkpoint file to resume from
+
     Returns:
         Tuple of (total_files, successful_files, failed_files, results_zip_path)
     """
+    # Initialize checkpoint
+    checkpoint = ProcessingCheckpoint()
+
+    if resume_checkpoint and os.path.exists(resume_checkpoint):
+        # Resume from existing checkpoint
+        checkpoint.load_session(resume_checkpoint)
+        logger.info(f"Resuming from checkpoint: {resume_checkpoint}")
+        if progress_callback:
+            progress_callback(f"📂 Resuming from checkpoint with {len(checkpoint.state['processed_files'])} already processed")
+    else:
+        # Create new checkpoint
+        session_id = f"{Path(input_dir).name}_{time.strftime('%Y%m%d_%H%M%S')}"
+        checkpoint_file = checkpoint.create_session(session_id)
+        logger.info(f"Created checkpoint: {checkpoint_file}")
+
     try:
         if progress_callback:
             progress_callback("🔍 Scanning directory for PDF files...")
         
         # Scan for PDF files
         pdf_files = scan_directory_for_pdfs(input_dir)
-        
+
+        # Filter out already processed files if resuming
+        if resume_checkpoint:
+            all_file_paths = [pdf_info[0] for pdf_info in pdf_files]
+            remaining_files = checkpoint.get_remaining_files(all_file_paths)
+            pdf_files = [pdf_info for pdf_info in pdf_files if pdf_info[0] in remaining_files]
+
+            if progress_callback:
+                progress_callback(f"📊 {len(remaining_files)} files remaining to process")
+
         if not pdf_files:
             if progress_callback:
-                progress_callback("❌ No PDF files found in the specified directory")
+                progress_callback("✅ All files have been processed" if resume_checkpoint else "❌ No PDF files found in the specified directory")
             return 0, 0, 0, None
         
         if progress_callback:
@@ -796,14 +823,16 @@ async def batch_process_directory(
 
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Count results and handle exceptions
+            # Count results and handle exceptions, update checkpoint
             for j, result in enumerate(batch_results):
+                pdf_path, relative_path = batch[j]
+
                 if isinstance(result, Exception):
                     # Handle unexpected exceptions not caught by process_single_pdf_batch
-                    pdf_path, relative_path = batch[j]
                     error_msg = str(result)
                     tracker.mark_failure(pdf_path, error_msg)
                     results.append((False, pdf_path, error_msg))
+                    checkpoint.mark_file_processed(pdf_path, success=False)
 
                     # Try to move file to ERRORED folder
                     try:
@@ -812,6 +841,11 @@ async def batch_process_directory(
                         logger.warning(f"Failed to move error file: {move_error}")
                 else:
                     results.append(result)
+                    # Mark successful processing in checkpoint
+                    if result[0]:  # First element is success flag
+                        checkpoint.mark_file_processed(pdf_path, success=True)
+                    else:
+                        checkpoint.mark_file_processed(pdf_path, success=False)
         
         # Create results archive only if not MD-only mode
         output_root = os.path.join(output_dir, "MinerU_Outputs")

@@ -293,7 +293,12 @@ class TextRecognizer(BaseOCRV20):
         # Calculate the aspect ratio of all text bars
         width_list = []
         for img in img_list:
-            width_list.append(img.shape[1] / float(img.shape[0]))
+            # Avoid division by zero for invalid images
+            if img.shape[0] > 0:
+                width_list.append(img.shape[1] / float(img.shape[0]))
+            else:
+                # Use a default aspect ratio for invalid images
+                width_list.append(1.0)
         # Sorting can speed up the recognition process
         indices = np.argsort(np.array(width_list))
 
@@ -311,7 +316,11 @@ class TextRecognizer(BaseOCRV20):
                 for ino in range(beg_img_no, end_img_no):
                     # h, w = img_list[ino].shape[0:2]
                     h, w = img_list[indices[ino]].shape[0:2]
-                    wh_ratio = w * 1.0 / h
+                    # Avoid division by zero for invalid images
+                    if h > 0:
+                        wh_ratio = w * 1.0 / h
+                    else:
+                        wh_ratio = 1.0  # Default ratio for invalid images
                     max_wh_ratio = max(max_wh_ratio, wh_ratio)
                 for ino in range(beg_img_no, end_img_no):
                     if self.rec_algorithm == "SAR":
