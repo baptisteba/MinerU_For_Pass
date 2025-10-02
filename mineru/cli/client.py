@@ -1,8 +1,17 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import os
 import click
+import multiprocessing
 from pathlib import Path
 from loguru import logger
+
+# Fix for CUDA + multiprocessing fork issue
+# Set spawn method early to prevent PaddleOCR/PyTorch CUDA context fork crashes
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    # Already set, ignore
+    pass
 
 from mineru.utils.cli_parser import arg_parse
 from mineru.utils.config_reader import get_device

@@ -14,7 +14,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from loguru import logger
 import threading
-import multiprocessing
 from contextlib import contextmanager
 
 
@@ -167,17 +166,36 @@ class SafeProcessor:
             Tuple of (success: bool, result: Any, error: str)
         """
         try:
-            # Use multiprocessing for true isolation
-            with multiprocessing.Pool(processes=1) as pool:
-                async_result = pool.apply_async(func, args, kwargs)
+            # Direct execution without multiprocessing to avoid CUDA fork issues
+            # Using threading for timeout instead of multiprocessing
+            result = None
+            error = None
+            success = False
+
+            def worker():
+                nonlocal result, error, success
                 try:
-                    result = async_result.get(timeout=timeout_seconds)
-                    return True, result, None
-                except multiprocessing.TimeoutError:
-                    pool.terminate()
-                    return False, None, f"Processing timeout after {timeout_seconds} seconds"
+                    result = func(*args, **kwargs)
+                    success = True
                 except Exception as e:
-                    return False, None, str(e)
+                    error = str(e)
+                    logger.error(f"Function execution failed: {e}")
+
+            thread = threading.Thread(target=worker)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout=timeout_seconds)
+
+            if thread.is_alive():
+                # Timeout occurred
+                logger.warning(f"Processing timeout after {timeout_seconds} seconds")
+                return False, None, f"Processing timeout after {timeout_seconds} seconds"
+
+            if success:
+                return True, result, None
+            else:
+                return False, None, error or "Unknown error"
+
         except Exception as e:
             logger.error(f"Failed to execute safely: {e}")
             return False, None, str(e)
