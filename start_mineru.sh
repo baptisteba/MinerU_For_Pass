@@ -211,6 +211,9 @@ start_web() {
     print_status "Port: $WEB_PORT"
     print_status "URL: http://$HOST:$WEB_PORT"
 
+    # Fix for CUDA multiprocessing crash with fork() - use NVML-based CUDA check
+    export PYTORCH_NVML_BASED_CUDA_CHECK=1
+
     local cmd="mineru-gradio --server-name $HOST --server-port $WEB_PORT --max-convert-pages $MAX_PAGES"
 
     if [ -n "$ENABLE_SGLANG" ]; then
@@ -234,6 +237,9 @@ start_api() {
     print_status "Port: $API_PORT"
     print_status "Docs URL: http://$HOST:$API_PORT/docs"
 
+    # Fix for CUDA multiprocessing crash with fork() - use NVML-based CUDA check
+    export PYTORCH_NVML_BASED_CUDA_CHECK=1
+
     local cmd="mineru-api --host $HOST --port $API_PORT"
     print_status "Command: $cmd"
     exec $cmd
@@ -243,6 +249,9 @@ start_api() {
 start_sglang() {
     print_status "Starting SGLang server..."
     print_status "Port: $SGLANG_PORT"
+
+    # Fix for CUDA multiprocessing crash with fork() - use NVML-based CUDA check
+    export PYTORCH_NVML_BASED_CUDA_CHECK=1
 
     local cmd="mineru-sglang-server --port $SGLANG_PORT"
     print_status "Command: $cmd"
