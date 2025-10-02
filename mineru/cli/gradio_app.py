@@ -19,13 +19,10 @@ from gradio_pdf import PDF
 from loguru import logger
 
 # Fix for CUDA + multiprocessing fork issue
-# Set spawn method early to prevent PaddleOCR/PyTorch CUDA context fork crashes
-try:
-    multiprocessing.set_start_method('spawn', force=True)
-    logger.info("Multiprocessing start method set to 'spawn' for CUDA compatibility")
-except RuntimeError:
-    # Already set, ignore
-    pass
+# NOTE: We DON'T set spawn globally anymore because it causes memory issues
+# with large documents. Instead, we've removed multiprocessing.Pool usage
+# from crash_recovery.py which was the actual problem.
+# If multiprocessing is needed elsewhere, use get_context('spawn') locally
 
 # Optional import for HTML table parsing
 try:

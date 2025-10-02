@@ -6,12 +6,9 @@ from pathlib import Path
 from loguru import logger
 
 # Fix for CUDA + multiprocessing fork issue
-# Set spawn method early to prevent PaddleOCR/PyTorch CUDA context fork crashes
-try:
-    multiprocessing.set_start_method('spawn', force=True)
-except RuntimeError:
-    # Already set, ignore
-    pass
+# NOTE: We DON'T set spawn globally anymore because it causes memory issues
+# with large documents. The real fix is removing multiprocessing.Pool from
+# crash_recovery.py which was causing CUDA fork crashes.
 
 from mineru.utils.cli_parser import arg_parse
 from mineru.utils.config_reader import get_device

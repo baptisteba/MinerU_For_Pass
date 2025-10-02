@@ -129,6 +129,20 @@ def doc_analyze(
         batch_results = batch_image_analyze(batch_image, formula_enable, table_enable)
         results.extend(batch_results)
 
+        # Force garbage collection after each batch to prevent memory corruption
+        # with large documents (450+ pages). This prevents "corrupted double-linked list"
+        # errors caused by heap corruption in native libraries (PaddleOCR/OpenCV/PyTorch)
+        import gc
+        gc.collect()
+
+        # Clear CUDA cache if using GPU to free up GPU memory
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except:
+            pass
+
     # 构建返回结果
     infer_results = []
 
