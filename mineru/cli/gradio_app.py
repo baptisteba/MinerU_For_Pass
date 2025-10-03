@@ -1,10 +1,12 @@
 # Copyright (c) Opendatalab. All rights reserved.
 
 import base64
+import json
 import os
 import re
 import time
 import zipfile
+import tempfile
 from pathlib import Path
 import asyncio
 import threading
@@ -758,6 +760,26 @@ async def batch_process_directory(
         # Create new checkpoint
         session_id = f"{Path(input_dir).name}_{time.strftime('%Y%m%d_%H%M%S')}"
         checkpoint_file = checkpoint.create_session(session_id)
+
+        # Save processing parameters to checkpoint for future resume
+        checkpoint.update(
+            processing_params={
+                'input_dir': input_dir,
+                'output_dir': output_dir,
+                'max_pages': max_pages,
+                'is_ocr': is_ocr,
+                'formula_enable': formula_enable,
+                'table_enable': table_enable,
+                'images_enable': images_enable,
+                'language': language,
+                'backend': backend,
+                'server_url': server_url,
+                'md_only': md_only,
+                'fast_mode': fast_mode,
+                'csv_tables': csv_tables
+            }
+        )
+
         logger.info(f"Created checkpoint: {checkpoint_file}")
 
     try:
@@ -878,27 +900,160 @@ async def batch_process_directory(
                 progress_callback("\n" + "="*50)
                 progress_callback(tracker.get_error_summary())
 
+        # Mark checkpoint as completed
+        checkpoint.update(status="completed")
+        logger.info("Batch processing completed successfully - checkpoint marked as completed")
+
         return len(pdf_files), tracker.successful_files, tracker.failed_files, archive_zip_path
         
     except Exception as e:
         error_msg = f"Batch processing error: {str(e)}"
         logger.exception(error_msg)
+
+        # Mark checkpoint as crashed so it can be resumed
+        checkpoint.update(status="crashed", error=str(e))
+        logger.error(f"Batch processing crashed - checkpoint saved for recovery at: {checkpoint.checkpoint_file}")
+
         if progress_callback:
             progress_callback(f"❌ {error_msg}")
+            progress_callback(f"💾 Checkpoint saved for recovery. You can resume from checkpoint after restarting.")
+
         return 0, 0, 1, None
+
+
+def get_checkpoint_dir() -> Path:
+    """
+    Get the checkpoint directory path.
+
+    Uses permanent location in user's home directory (~/.mineru/checkpoints)
+    to ensure checkpoints survive web server restarts and system reboots.
+    """
+    home_dir = Path.home()
+    checkpoint_dir = home_dir / ".mineru" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir
+
+
+def list_available_checkpoints() -> List[Tuple[str, str]]:
+    """
+    List all available checkpoint files.
+
+    Returns:
+        List of tuples (display_name, checkpoint_path)
+    """
+    checkpoint_dir = get_checkpoint_dir()
+    checkpoints = []
+
+    if checkpoint_dir.exists():
+        for checkpoint_file in sorted(checkpoint_dir.glob("checkpoint_*.json"), reverse=True):
+            try:
+                with open(checkpoint_file, 'r') as f:
+                    data = json.load(f)
+                    session_id = data.get('session_id', 'Unknown')
+                    created_at = data.get('created_at', 'Unknown')
+                    processed_count = len(data.get('processed_files', []))
+                    failed_count = len(data.get('failed_files', []))
+                    status = data.get('status', 'unknown')
+
+                    display_name = f"{session_id} | {created_at} | Processed: {processed_count}, Failed: {failed_count} | Status: {status}"
+                    checkpoints.append((display_name, str(checkpoint_file)))
+            except Exception as e:
+                logger.warning(f"Failed to read checkpoint {checkpoint_file}: {e}")
+
+    return checkpoints
+
+
+def load_checkpoint_info(checkpoint_path: str) -> Dict:
+    """
+    Load checkpoint information for display.
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+
+    Returns:
+        Dictionary with checkpoint information
+    """
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return {}
+
+    try:
+        with open(checkpoint_path, 'r') as f:
+            data = json.load(f)
+
+        # Format information for display
+        info = {
+            'session_id': data.get('session_id', 'Unknown'),
+            'created_at': data.get('created_at', 'Unknown'),
+            'last_update': data.get('last_update', 'Unknown'),
+            'status': data.get('status', 'unknown'),
+            'processed_count': len(data.get('processed_files', [])),
+            'failed_count': len(data.get('failed_files', [])),
+            'processing_params': data.get('processing_params', {})
+        }
+
+        return info
+    except Exception as e:
+        logger.error(f"Failed to load checkpoint info: {e}")
+        return {}
+
+
+def format_checkpoint_info(info: Dict) -> str:
+    """Format checkpoint info for display in UI."""
+    if not info:
+        return "No checkpoint selected"
+
+    status = info.get('status', 'unknown')
+
+    # Add status emoji
+    status_emoji = {
+        'started': '🔄',
+        'completed': '✅',
+        'crashed': '❌',
+        'unknown': '❓'
+    }.get(status, '❓')
+
+    text = f"📋 **Checkpoint Information**\n\n"
+    text += f"**Session:** {info.get('session_id', 'Unknown')}\n"
+    text += f"**Created:** {info.get('created_at', 'Unknown')}\n"
+    text += f"**Last Update:** {info.get('last_update', 'Unknown')}\n"
+    text += f"**Status:** {status_emoji} {status}\n"
+    text += f"**Processed Files:** {info.get('processed_count', 0)}\n"
+    text += f"**Failed Files:** {info.get('failed_count', 0)}\n\n"
+
+    # Highlight if resumable
+    if status in ['started', 'crashed']:
+        remaining = info.get('processing_params', {}).get('total_files', 0) - info.get('processed_count', 0) - info.get('failed_count', 0)
+        if remaining > 0 or status == 'crashed':
+            text += f"⚠️ **This session can be resumed!**\n"
+            text += f"Files still need processing or session was interrupted.\n\n"
+
+    params = info.get('processing_params', {})
+    if params:
+        text += "**Original Settings:**\n"
+        text += f"- Input Directory: {params.get('input_dir', 'N/A')}\n"
+        text += f"- Output Directory: {params.get('output_dir', 'N/A')}\n"
+        text += f"- Backend: {params.get('backend', 'N/A')}\n"
+        text += f"- Max Pages: {params.get('max_pages', 'N/A')}\n"
+        text += f"- Language: {params.get('language', 'N/A')}\n"
+        text += f"- Formula Recognition: {params.get('formula_enable', 'N/A')}\n"
+        text += f"- Table Recognition: {params.get('table_enable', 'N/A')}\n"
+        text += f"- MD Only: {params.get('md_only', 'N/A')}\n"
+        text += f"- Fast Mode: {params.get('fast_mode', 'N/A')}\n"
+
+    return text
 
 
 def validate_directory_path(dir_path: str) -> str:
     """Validate and return directory path status."""
     if not dir_path:
         return "Please enter a directory path"
-    
+
     if not os.path.exists(dir_path):
         return "Directory does not exist"
-    
+
     if not os.path.isdir(dir_path):
         return "Path is not a directory"
-    
+
     try:
         # Check if we can scan the directory
         pdf_files = scan_directory_for_pdfs(dir_path)
@@ -908,21 +1063,25 @@ def validate_directory_path(dir_path: str) -> str:
 
 
 def run_batch_processing(input_dir, output_dir, max_pages, is_ocr, formula_enable,
-                        table_enable, images_enable, csv_tables, language, backend, url, md_only, fast_mode):
+                        table_enable, images_enable, csv_tables, language, backend, url, md_only, fast_mode,
+                        resume_checkpoint=None):
     """
     Wrapper function to run batch processing from Gradio interface.
+
+    Args:
+        resume_checkpoint: Optional path to checkpoint file to resume from
     """
     if not input_dir or not input_dir.strip():
         return "❌ Please specify an input directory", None, "Processing failed - no input directory specified"
-    
+
     if not output_dir or not output_dir.strip():
         return "❌ Please specify an output directory", None, "Processing failed - no output directory specified"
-    
+
     # Validate directories
     input_status = validate_directory_path(input_dir.strip())
     if not input_status.startswith("✓"):
         return f"❌ Input directory error: {input_status}", None, "Processing failed - invalid input directory"
-    
+
     # Create output directory if it doesn't exist
     output_dir = output_dir.strip()
     try:
@@ -973,7 +1132,8 @@ def run_batch_processing(input_dir, output_dir, max_pages, is_ocr, formula_enabl
                 md_only=md_only,
                 fast_mode=fast_mode,
                 csv_tables=csv_tables,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                resume_checkpoint=resume_checkpoint
             )
         )
         
@@ -1168,7 +1328,38 @@ def main(ctx,
                     with gr.Column(variant='panel', scale=5):
                         gr.Markdown("## Batch Directory Processing")
                         gr.Markdown("Process all PDF files in a directory while maintaining folder structure.")
-                        
+
+                        # Crash Recovery Section
+                        with gr.Accordion("🔄 Crash Recovery - Resume from Checkpoint", open=False):
+                            gr.Markdown("Resume processing from a previous session that was interrupted or crashed.")
+                            with gr.Row():
+                                resume_mode = gr.Checkbox(
+                                    label='Enable Resume Mode',
+                                    value=False,
+                                    info='Check this to resume from a checkpoint'
+                                )
+                            with gr.Row():
+                                refresh_checkpoints_btn = gr.Button('🔄 Refresh Checkpoint List', size='sm')
+                            with gr.Row():
+                                checkpoint_dropdown = gr.Dropdown(
+                                    label='Select Checkpoint',
+                                    choices=[],
+                                    interactive=True,
+                                    info='Select a checkpoint to resume from'
+                                )
+                            with gr.Row():
+                                checkpoint_info_display = gr.Markdown(
+                                    value="No checkpoint selected",
+                                    label='Checkpoint Details'
+                                )
+                            with gr.Row():
+                                load_checkpoint_settings_btn = gr.Button(
+                                    '📥 Load Settings from Checkpoint',
+                                    variant='secondary',
+                                    size='sm'
+                                )
+                            gr.Markdown("*Resume mode will skip already processed files and continue from where it stopped.*")
+
                         with gr.Row():
                             batch_input_dir = gr.Textbox(
                                 label='Input Directory Path',
@@ -1271,6 +1462,95 @@ def main(ctx,
 
             return "\n".join(messages)
 
+        # Function to refresh checkpoint list
+        def refresh_checkpoint_list():
+            checkpoints = list_available_checkpoints()
+            if checkpoints:
+                choices = [display_name for display_name, _ in checkpoints]
+                return gr.update(choices=choices, value=None)
+            else:
+                return gr.update(choices=["No checkpoints available"], value=None)
+
+        # Function to handle checkpoint selection
+        def on_checkpoint_selected(checkpoint_display_name):
+            if not checkpoint_display_name or checkpoint_display_name == "No checkpoints available":
+                return "No checkpoint selected"
+
+            # Find the actual checkpoint path from display name
+            checkpoints = list_available_checkpoints()
+            checkpoint_path = None
+            for display_name, path in checkpoints:
+                if display_name == checkpoint_display_name:
+                    checkpoint_path = path
+                    break
+
+            if not checkpoint_path:
+                return "Invalid checkpoint selected"
+
+            # Load and format checkpoint info
+            info = load_checkpoint_info(checkpoint_path)
+            return format_checkpoint_info(info)
+
+        # Function to load settings from checkpoint
+        def load_settings_from_checkpoint(checkpoint_display_name):
+            if not checkpoint_display_name or checkpoint_display_name == "No checkpoints available":
+                return tuple([gr.update() for _ in range(11)])  # Return no updates
+
+            # Find the actual checkpoint path from display name
+            checkpoints = list_available_checkpoints()
+            checkpoint_path = None
+            for display_name, path in checkpoints:
+                if display_name == checkpoint_display_name:
+                    checkpoint_path = path
+                    break
+
+            if not checkpoint_path:
+                return tuple([gr.update() for _ in range(11)])
+
+            # Load checkpoint info
+            info = load_checkpoint_info(checkpoint_path)
+            params = info.get('processing_params', {})
+
+            if not params:
+                return tuple([gr.update() for _ in range(11)])
+
+            # Return updates for all fields
+            return (
+                gr.update(value=params.get('input_dir', '')),           # batch_input_dir
+                gr.update(value=params.get('output_dir', '')),          # batch_output_dir
+                gr.update(value=params.get('max_pages', 500)),          # batch_max_pages
+                gr.update(value=params.get('backend', 'pipeline')),     # batch_backend
+                gr.update(value=params.get('server_url', '')),          # batch_url
+                gr.update(value=params.get('is_ocr', False)),           # batch_is_ocr
+                gr.update(value=params.get('formula_enable', True)),    # batch_formula_enable
+                gr.update(value=params.get('table_enable', True)),      # batch_table_enable
+                gr.update(value=params.get('images_enable', False)),    # batch_images_enable
+                gr.update(value=params.get('csv_tables', True)),        # batch_csv_tables
+                gr.update(value=params.get('language', 'en')),          # batch_language
+                gr.update(value=params.get('md_only', True)),           # batch_md_only
+                gr.update(value=params.get('fast_mode', True))          # batch_fast_mode
+            )
+
+        # Function to handle batch processing with resume support
+        def run_batch_with_resume(input_dir, output_dir, max_pages, is_ocr, formula_enable,
+                                  table_enable, images_enable, csv_tables, language, backend, url,
+                                  md_only, fast_mode, resume_enabled, checkpoint_display_name):
+            # Determine checkpoint path if resume mode is enabled
+            checkpoint_path = None
+            if resume_enabled and checkpoint_display_name and checkpoint_display_name != "No checkpoints available":
+                checkpoints = list_available_checkpoints()
+                for display_name, path in checkpoints:
+                    if display_name == checkpoint_display_name:
+                        checkpoint_path = path
+                        break
+
+            # Call the original batch processing function
+            return run_batch_processing(
+                input_dir, output_dir, max_pages, is_ocr, formula_enable,
+                table_enable, images_enable, csv_tables, language, backend, url,
+                md_only, fast_mode, resume_checkpoint=checkpoint_path
+            )
+
         # Function to handle fast mode toggle for single file processing
         def handle_fast_mode_single(md_only_val, fast_mode_val):
             if fast_mode_val and md_only_val:
@@ -1325,6 +1605,14 @@ def main(ctx,
             fn=update_interface,
             inputs=[backend],
             outputs=[client_options, ocr_options],
+            api_name=False
+        )
+
+        # Load available checkpoints on page load
+        demo.load(
+            fn=refresh_checkpoint_list,
+            inputs=[],
+            outputs=[checkpoint_dropdown],
             api_name=False
         )
 
@@ -1411,13 +1699,41 @@ def main(ctx,
             api_name=api_name
         )
         
-        # Batch processing
+        # Checkpoint management event handlers
+        refresh_checkpoints_btn.click(
+            fn=refresh_checkpoint_list,
+            inputs=[],
+            outputs=[checkpoint_dropdown],
+            api_name=False
+        )
+
+        checkpoint_dropdown.change(
+            fn=on_checkpoint_selected,
+            inputs=[checkpoint_dropdown],
+            outputs=[checkpoint_info_display],
+            api_name=False
+        )
+
+        load_checkpoint_settings_btn.click(
+            fn=load_settings_from_checkpoint,
+            inputs=[checkpoint_dropdown],
+            outputs=[
+                batch_input_dir, batch_output_dir, batch_max_pages, batch_backend,
+                batch_url, batch_is_ocr, batch_formula_enable, batch_table_enable,
+                batch_images_enable, batch_csv_tables, batch_language, batch_md_only,
+                batch_fast_mode
+            ],
+            api_name=False
+        )
+
+        # Batch processing with resume support
         batch_process_btn.click(
-            fn=run_batch_processing,
+            fn=run_batch_with_resume,
             inputs=[
                 batch_input_dir, batch_output_dir, batch_max_pages, batch_is_ocr,
                 batch_formula_enable, batch_table_enable, batch_images_enable, batch_csv_tables,
-                batch_language, batch_backend, batch_url, batch_md_only, batch_fast_mode
+                batch_language, batch_backend, batch_url, batch_md_only, batch_fast_mode,
+                resume_mode, checkpoint_dropdown
             ],
             outputs=[batch_summary, batch_output_file, batch_progress],
             api_name=api_name

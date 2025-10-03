@@ -24,12 +24,15 @@ class ProcessingCheckpoint:
         """Initialize checkpoint manager.
 
         Args:
-            checkpoint_dir: Directory to store checkpoint files. If None, uses temp directory.
+            checkpoint_dir: Directory to store checkpoint files. If None, uses ~/.mineru/checkpoints
         """
         if checkpoint_dir:
             self.checkpoint_dir = Path(checkpoint_dir)
         else:
-            self.checkpoint_dir = Path(tempfile.gettempdir()) / "mineru_checkpoints"
+            # Use permanent location in user's home directory instead of /tmp
+            # This ensures checkpoints survive web server restarts and system reboots
+            home_dir = Path.home()
+            self.checkpoint_dir = home_dir / ".mineru" / "checkpoints"
 
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_file = None
