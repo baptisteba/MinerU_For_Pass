@@ -3,7 +3,9 @@ import io
 import json
 import os
 import copy
+import gc
 from pathlib import Path
+from contextlib import contextmanager
 
 import pypdfium2 as pdfium
 from loguru import logger
@@ -16,8 +18,32 @@ from mineru.backend.vlm.vlm_middle_json_mkcontent import union_make as vlm_union
 from mineru.backend.vlm.vlm_analyze import doc_analyze as vlm_doc_analyze
 from mineru.backend.vlm.vlm_analyze import aio_doc_analyze as aio_vlm_doc_analyze
 
+# Use simple suffix list (compatible, doesn't require magika)
 pdf_suffixes = [".pdf"]
-image_suffixes = [".png", ".jpeg", ".jpg", ".webp", ".gif"]
+image_suffixes = [".png", ".jpeg", ".jpg", ".webp", ".gif", ".bmp", ".jp2"]
+
+
+@contextmanager
+def safe_pdf_document(pdf_bytes):
+    """
+    Context manager for safe pypdfium2 usage.
+    Ensures proper cleanup even on exceptions to prevent C++ memory corruption.
+    """
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        yield pdf
+    except Exception as e:
+        logger.error(f"Error in pypdfium2 PDF document: {e}")
+        raise
+    finally:
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception as e:
+                logger.warning(f"Failed to close PDF document: {e}")
+        # Force garbage collection to ensure C++ objects are destroyed
+        gc.collect()
 
 
 def read_fn(path):
@@ -25,9 +51,10 @@ def read_fn(path):
         path = Path(path)
     with open(str(path), "rb") as input_file:
         file_bytes = input_file.read()
-        if path.suffix in image_suffixes:
+        # Use simple suffix detection (compatible with current setup)
+        if path.suffix.lower() in image_suffixes:
             return images_bytes_to_pdf_bytes(file_bytes)
-        elif path.suffix in pdf_suffixes:
+        elif path.suffix.lower() in pdf_suffixes:
             return file_bytes
         else:
             raise Exception(f"Unknown file suffix: {path.suffix}")
@@ -43,36 +70,72 @@ def prepare_env(output_dir, pdf_file_name, parse_method, create_images_dir=True)
 
 
 def convert_pdf_bytes_to_bytes_by_pypdfium2(pdf_bytes, start_page_id=0, end_page_id=None):
+    """
+    Convert PDF bytes to bytes using pypdfium2 with safe resource management.
 
-    # 从字节数据加载PDF
-    pdf = pdfium.PdfDocument(pdf_bytes)
+    IMPORTANT: This function now uses a context manager to prevent C++ memory corruption
+    that was causing crashes every 5-6 files ("Pure virtual function called!" error).
+    """
+    output_pdf = None
+    output_buffer = None
 
-    # 确定结束页
-    end_page_id = end_page_id if end_page_id is not None and end_page_id >= 0 else len(pdf) - 1
-    if end_page_id > len(pdf) - 1:
-        logger.warning("end_page_id is out of range, use pdf_docs length")
-        end_page_id = len(pdf) - 1
+    try:
+        # Use safe context manager for PDF document
+        with safe_pdf_document(pdf_bytes) as pdf:
+            # Validate and determine end page
+            max_pages = len(pdf)
 
-    # 创建一个新的PDF文档
-    output_pdf = pdfium.PdfDocument.new()
+            # Handle end_page_id
+            if end_page_id is None or end_page_id < 0:
+                end_page_id = max_pages - 1
+            elif end_page_id > max_pages - 1:
+                logger.warning(f"end_page_id ({end_page_id}) is out of range (max: {max_pages-1}), using max pages")
+                end_page_id = max_pages - 1
 
-    # 选择要导入的页面索引
-    page_indices = list(range(start_page_id, end_page_id + 1))
+            # Validate start_page_id
+            if start_page_id < 0:
+                logger.warning(f"start_page_id ({start_page_id}) is negative, using 0")
+                start_page_id = 0
+            elif start_page_id > end_page_id:
+                logger.error(f"Invalid page range: start={start_page_id}, end={end_page_id}, returning original")
+                return pdf_bytes
 
-    # 从原PDF导入页面到新PDF
-    output_pdf.import_pages(pdf, page_indices)
+            # Create output PDF and import pages
+            try:
+                output_pdf = pdfium.PdfDocument.new()
+                page_indices = list(range(start_page_id, end_page_id + 1))
 
-    # 将新PDF保存到内存缓冲区
-    output_buffer = io.BytesIO()
-    output_pdf.save(output_buffer)
+                # Import pages
+                output_pdf.import_pages(pdf, page_indices)
 
-    # 获取字节数据
-    output_bytes = output_buffer.getvalue()
+                # Save to buffer
+                output_buffer = io.BytesIO()
+                output_pdf.save(output_buffer)
+                output_bytes = output_buffer.getvalue()
 
-    pdf.close()  # 关闭原PDF文档以释放资源
-    output_pdf.close()  # 关闭新PDF文档以释放资源
+                return output_bytes
 
-    return output_bytes
+            finally:
+                # Ensure output_pdf is closed
+                if output_pdf is not None:
+                    try:
+                        output_pdf.close()
+                    except Exception as e:
+                        logger.warning(f"Failed to close output PDF: {e}")
+
+                # Clear buffer
+                if output_buffer is not None:
+                    try:
+                        output_buffer.close()
+                    except:
+                        pass
+
+    except Exception as e:
+        logger.error(f"Failed to convert PDF bytes: {e}")
+        raise
+    finally:
+        # Aggressive cleanup to prevent memory leaks
+        gc.collect()
 
 
 def _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id):

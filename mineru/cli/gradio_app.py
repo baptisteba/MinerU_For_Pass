@@ -11,6 +11,8 @@ from pathlib import Path
 import asyncio
 import threading
 import shutil
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Optional, Dict
 import multiprocessing
@@ -716,6 +718,145 @@ async def process_single_pdf_batch(pdf_info: Tuple[str, str], output_base_dir: s
 
         return False, pdf_path, error_msg
 
+    finally:
+        # Aggressive resource cleanup after each file to prevent C++ memory corruption
+        # Using upstream's improved clean_memory (includes torch.cuda.ipc_collect)
+        try:
+            from mineru.utils.model_utils import clean_memory
+            clean_memory('cuda')  # Upstream version - better than manual empty_cache!
+        except ImportError:
+            # Fallback if model_utils not available
+            import gc
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except:
+                pass
+            gc.collect()
+
+        # Small delay to allow C++ destructors to complete
+        await asyncio.sleep(0.05)
+
+
+async def batch_process_directory_with_auto_restart(
+    input_dir: str,
+    output_dir: str,
+    max_pages: int = 10,
+    is_ocr: bool = False,
+    formula_enable: bool = True,
+    table_enable: bool = True,
+    images_enable: bool = False,
+    language: str = "en",
+    backend: str = "pipeline",
+    server_url: str = None,
+    md_only: bool = False,
+    fast_mode: bool = False,
+    csv_tables: bool = True,
+    progress_callback=None,
+    resume_checkpoint: Optional[str] = None,
+    max_restart_attempts: int = 10
+):
+    """
+    Batch process with automatic crash recovery and restart.
+
+    This wrapper automatically restarts processing from the last checkpoint
+    when a crash occurs, eliminating the need for manual restarts every 5-6 files.
+
+    Args:
+        max_restart_attempts: Maximum number of auto-restart attempts (default: 10)
+        All other args: Same as batch_process_directory
+
+    Returns:
+        Same as batch_process_directory
+    """
+    restart_count = 0
+    last_checkpoint_file = resume_checkpoint
+
+    while restart_count < max_restart_attempts:
+        try:
+            # Attempt processing
+            result = await batch_process_directory(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                max_pages=max_pages,
+                is_ocr=is_ocr,
+                formula_enable=formula_enable,
+                table_enable=table_enable,
+                images_enable=images_enable,
+                language=language,
+                backend=backend,
+                server_url=server_url,
+                md_only=md_only,
+                fast_mode=fast_mode,
+                csv_tables=csv_tables,
+                progress_callback=progress_callback,
+                resume_checkpoint=last_checkpoint_file
+            )
+
+            # Success! Processing completed without crash
+            if progress_callback:
+                if restart_count > 0:
+                    progress_callback(f"✅ Processing completed successfully after {restart_count} auto-restart(s)")
+
+            return result
+
+        except Exception as e:
+            restart_count += 1
+            error_msg = str(e)
+
+            logger.error(f"💥 Crash detected (restart attempt {restart_count}/{max_restart_attempts}): {error_msg}")
+
+            if progress_callback:
+                progress_callback(f"⚠️ Crash detected: {error_msg}")
+                progress_callback(f"🔄 Auto-restarting from checkpoint (attempt {restart_count}/{max_restart_attempts})...")
+
+            # Check if we've exceeded max attempts
+            if restart_count >= max_restart_attempts:
+                logger.error("❌ Maximum restart attempts reached - cannot continue")
+                if progress_callback:
+                    progress_callback(f"❌ Max restart attempts ({max_restart_attempts}) reached. Processing incomplete.")
+                return 0, 0, 1, None
+
+            # Find the most recent checkpoint to resume from
+            try:
+                checkpoint_dir = get_checkpoint_dir()
+                checkpoints = list(checkpoint_dir.glob("checkpoint_*.json"))
+
+                if checkpoints:
+                    # Find most recent checkpoint
+                    latest_checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime)
+                    last_checkpoint_file = str(latest_checkpoint)
+
+                    # Load checkpoint to see progress
+                    with open(latest_checkpoint, 'r') as f:
+                        checkpoint_data = json.load(f)
+                        processed_count = len(checkpoint_data.get('processed_files', []))
+
+                    logger.info(f"📂 Found checkpoint: {latest_checkpoint.name}")
+                    logger.info(f"   Already processed: {processed_count} files")
+
+                    if progress_callback:
+                        progress_callback(f"📂 Resuming from checkpoint with {processed_count} files already processed")
+
+                else:
+                    logger.warning("⚠️ No checkpoint found for auto-resume")
+                    if progress_callback:
+                        progress_callback("⚠️ No checkpoint found - cannot auto-restart")
+                    return 0, 0, 1, None
+
+            except Exception as checkpoint_error:
+                logger.error(f"Failed to load checkpoint for restart: {checkpoint_error}")
+                if progress_callback:
+                    progress_callback(f"❌ Failed to load checkpoint: {checkpoint_error}")
+                return 0, 0, 1, None
+
+            # Small delay before restart to allow resources to settle
+            await asyncio.sleep(2)
+
+            # Continue loop to retry with checkpoint
+
 
 async def batch_process_directory(
     input_dir: str,
@@ -1062,6 +1203,247 @@ def validate_directory_path(dir_path: str) -> str:
         return f"Error scanning directory: {str(e)}"
 
 
+def run_batch_processing_with_subprocess_protection(
+    input_dir, output_dir, max_pages, is_ocr, formula_enable,
+    table_enable, images_enable, csv_tables, language, backend, url, md_only, fast_mode,
+    resume_checkpoint=None, max_restart_attempts=10
+):
+    """
+    Run batch processing in a subprocess to protect against core dumps and crashes.
+
+    This function launches the batch processor as a subprocess and monitors it.
+    If the subprocess crashes (for any reason including core dumps), it automatically
+    restarts from the last checkpoint until all files are processed or max attempts reached.
+
+    Args:
+        max_restart_attempts: Maximum number of restart attempts (default: 10)
+        All other args: Same as run_batch_processing
+    """
+    if not input_dir or not input_dir.strip():
+        return "❌ Please specify an input directory", None, "Processing failed - no input directory specified"
+
+    if not output_dir or not output_dir.strip():
+        return "❌ Please specify an output directory", None, "Processing failed - no output directory specified"
+
+    # Validate directories
+    input_status = validate_directory_path(input_dir.strip())
+    if not input_status.startswith("✓"):
+        return f"❌ Input directory error: {input_status}", None, "Processing failed - invalid input directory"
+
+    # Create output directory if it doesn't exist
+    output_dir = output_dir.strip()
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        return f"❌ Cannot create output directory: {str(e)}", None, "Processing failed - cannot create output directory"
+
+    # Track progress messages
+    progress_messages = []
+
+    def add_progress(message):
+        """Add progress message to tracking."""
+        if isinstance(message, str):
+            for line in message.split('\n'):
+                if line.strip():
+                    progress_messages.append(line.strip())
+        else:
+            progress_messages.append(str(message))
+
+    # Get path to worker script
+    worker_script = Path(__file__).parent / "batch_worker.py"
+    if not worker_script.exists():
+        return f"❌ Worker script not found: {worker_script}", None, "Processing failed - worker script missing"
+
+    # Initial configuration for worker
+    config = {
+        'input_dir': input_dir.strip(),
+        'output_dir': output_dir,
+        'max_pages': max_pages,
+        'is_ocr': is_ocr,
+        'formula_enable': formula_enable,
+        'table_enable': table_enable,
+        'images_enable': images_enable,
+        'language': language,
+        'backend': backend,
+        'server_url': url if url and url.strip() else None,
+        'md_only': md_only,
+        'fast_mode': fast_mode,
+        'csv_tables': csv_tables,
+        'resume_checkpoint': resume_checkpoint
+    }
+
+    restart_count = 0
+    last_result = None
+
+    while restart_count <= max_restart_attempts:
+        try:
+            # Write configuration to temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as config_file:
+                json.dump(config, config_file, indent=2)
+                config_path = config_file.name
+
+            add_progress(f"🚀 Starting batch processing (attempt {restart_count + 1}/{max_restart_attempts + 1})...")
+            if config['resume_checkpoint']:
+                add_progress(f"📂 Resuming from checkpoint: {Path(config['resume_checkpoint']).name}")
+
+            # Launch worker subprocess - don't capture stdout/stderr so logs go to terminal
+            process = subprocess.Popen(
+                [sys.executable, str(worker_script), config_path],
+                stdout=subprocess.PIPE,
+                stderr=None,  # stderr goes directly to terminal
+                text=True,
+                bufsize=1
+            )
+
+            # Monitor subprocess output
+            result_data = None
+            error_data = None
+
+            # Read output line by line
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+
+                if line:
+                    # Always print the line to terminal for visibility
+                    print(line.rstrip(), flush=True)
+
+                    line = line.strip()
+                    if line.startswith("PROGRESS:"):
+                        # Extract progress message
+                        msg = line[9:].strip()
+                        add_progress(msg)
+                    elif line.startswith("RESULT:"):
+                        # Extract result JSON
+                        result_json = line[7:].strip()
+                        try:
+                            result_data = json.loads(result_json)
+                        except json.JSONDecodeError:
+                            pass
+                    elif line.startswith("ERROR:"):
+                        # Extract error JSON
+                        error_json = line[6:].strip()
+                        try:
+                            error_data = json.loads(error_json)
+                        except json.JSONDecodeError:
+                            pass
+
+            # Wait for process to complete
+            returncode = process.wait()
+
+            # Clean up config file
+            try:
+                os.unlink(config_path)
+            except:
+                pass
+
+            # Check result
+            if returncode == 0 and result_data and result_data.get('status') == 'completed':
+                # Success!
+                last_result = result_data
+                add_progress("✅ Batch processing completed successfully!")
+
+                if restart_count > 0:
+                    add_progress(f"📊 Processing survived {restart_count} crash(es) and recovered automatically")
+
+                # Generate summary
+                total_files = result_data.get('total_files', 0)
+                successful_files = result_data.get('successful_files', 0)
+                failed_files = result_data.get('failed_files', 0)
+                zip_path = result_data.get('zip_path')
+
+                success_rate = (successful_files / total_files * 100) if total_files > 0 else 0
+                summary = f"✅ Batch processing completed:\n"
+                summary += f"• Total files: {total_files}\n"
+                summary += f"• Successful: {successful_files} ({success_rate:.1f}%)\n"
+                summary += f"• Failed: {failed_files}\n"
+                if zip_path:
+                    summary += f"• Results archive: {os.path.basename(zip_path)}\n"
+                if failed_files > 0:
+                    summary += f"• Failed files copied to: {os.path.join(output_dir, 'ERRORED')}\n"
+                summary += f"• Output directory: {os.path.join(output_dir, 'MinerU_Outputs')}"
+
+                return summary, zip_path, "\n".join(progress_messages)
+
+            # Process crashed or failed
+            restart_count += 1
+
+            if returncode != 0:
+                if returncode < 0:
+                    # Killed by signal (e.g., SIGSEGV, SIGTRAP)
+                    signal_name = {-11: "SIGSEGV (Segmentation Fault)", -5: "SIGTRAP (Core Dump)"}.get(returncode, f"Signal {-returncode}")
+                    add_progress(f"💥 Worker crashed: {signal_name}")
+                    logger.error(f"Worker process crashed with signal: {signal_name}")
+                else:
+                    add_progress(f"💥 Worker failed with exit code: {returncode}")
+                    logger.error(f"Worker process failed with exit code: {returncode}")
+
+                if error_data:
+                    add_progress(f"   Error: {error_data.get('error', 'Unknown')}")
+
+            # Check if we should restart
+            if restart_count > max_restart_attempts:
+                add_progress(f"❌ Maximum restart attempts ({max_restart_attempts}) reached")
+                summary = "❌ Processing failed after maximum restart attempts"
+                return summary, None, "\n".join(progress_messages)
+
+            # Find latest checkpoint to resume from
+            add_progress(f"🔄 Attempting automatic restart (attempt {restart_count + 1}/{max_restart_attempts + 1})...")
+
+            checkpoint_dir = get_checkpoint_dir()
+            checkpoints = list(checkpoint_dir.glob("checkpoint_*.json"))
+
+            if checkpoints:
+                # Find most recent checkpoint
+                latest_checkpoint = max(checkpoints, key=lambda p: p.stat().st_mtime)
+
+                # Load checkpoint to verify it's valid
+                try:
+                    with open(latest_checkpoint, 'r') as f:
+                        checkpoint_data = json.load(f)
+                        processed_count = len(checkpoint_data.get('processed_files', []))
+                        status = checkpoint_data.get('status', 'unknown')
+
+                    if status != 'completed':
+                        config['resume_checkpoint'] = str(latest_checkpoint)
+                        add_progress(f"📂 Found checkpoint: {latest_checkpoint.name}")
+                        add_progress(f"   Already processed: {processed_count} files")
+                        add_progress(f"   Status: {status}")
+
+                        # Small delay before restart
+                        time.sleep(2)
+
+                        # Continue loop to restart with checkpoint
+                        continue
+                    else:
+                        add_progress("✅ All files already processed according to checkpoint")
+                        break
+
+                except Exception as checkpoint_error:
+                    logger.error(f"Failed to load checkpoint: {checkpoint_error}")
+                    add_progress(f"⚠️ Failed to load checkpoint: {checkpoint_error}")
+            else:
+                add_progress("⚠️ No checkpoint found - cannot auto-restart")
+                break
+
+        except Exception as e:
+            error_msg = f"❌ Subprocess manager error: {str(e)}"
+            logger.exception(error_msg)
+            add_progress(error_msg)
+
+            restart_count += 1
+            if restart_count > max_restart_attempts:
+                break
+
+            add_progress(f"🔄 Retrying after error (attempt {restart_count + 1}/{max_restart_attempts + 1})...")
+            time.sleep(2)
+
+    # If we get here, we've exhausted retries or hit an error
+    summary = "❌ Batch processing incomplete - see progress log for details"
+    return summary, None, "\n".join(progress_messages)
+
+
 def run_batch_processing(input_dir, output_dir, max_pages, is_ocr, formula_enable,
                         table_enable, images_enable, csv_tables, language, backend, url, md_only, fast_mode,
                         resume_checkpoint=None):
@@ -1116,9 +1498,9 @@ def run_batch_processing(input_dir, output_dir, max_pages, is_ocr, formula_enabl
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         
-        # Run the batch processing
+        # Run the batch processing with auto-restart enabled
         result = loop.run_until_complete(
-            batch_process_directory(
+            batch_process_directory_with_auto_restart(
                 input_dir=input_dir.strip(),
                 output_dir=output_dir,
                 max_pages=max_pages,
@@ -1133,7 +1515,8 @@ def run_batch_processing(input_dir, output_dir, max_pages, is_ocr, formula_enabl
                 fast_mode=fast_mode,
                 csv_tables=csv_tables,
                 progress_callback=progress_callback,
-                resume_checkpoint=resume_checkpoint
+                resume_checkpoint=resume_checkpoint,
+                max_restart_attempts=10  # Allow up to 10 auto-restarts
             )
         )
         
@@ -1544,11 +1927,13 @@ def main(ctx,
                         checkpoint_path = path
                         break
 
-            # Call the original batch processing function
-            return run_batch_processing(
+            # Call the subprocess-protected batch processing function
+            # This version will automatically restart on crashes (core dumps, SIGSEGV, etc.)
+            return run_batch_processing_with_subprocess_protection(
                 input_dir, output_dir, max_pages, is_ocr, formula_enable,
                 table_enable, images_enable, csv_tables, language, backend, url,
-                md_only, fast_mode, resume_checkpoint=checkpoint_path
+                md_only, fast_mode, resume_checkpoint=checkpoint_path,
+                max_restart_attempts=10  # Allow up to 10 automatic restarts
             )
 
         # Function to handle fast mode toggle for single file processing
